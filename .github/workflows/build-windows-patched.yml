@@ -1,0 +1,91 @@
+name: Build Windows exe (patched)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'fix-**'
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Windows Release
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Publish a rolling GitHub Release only for main; fix-* branches stay artifact-only.
+      PUBLISH_RELEASE: ${{ github.ref == 'refs/heads/main' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine Version
+        run: |
+          VERSION=$(git describe --tags)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.0'
+
+      - name: Build Frontend
+        env:
+          CI: ""
+        run: |
+          cd web
+          bun install --frozen-lockfile
+          DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$VERSION bun run build
+          cd ..
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.25.1'
+
+      - name: Build Backend
+        run: |
+          go mod download
+          go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION'" -o new-api-$VERSION-patched.exe
+
+      - name: Generate checksums
+        run: sha256sum new-api-*.exe > checksums-windows.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: |
+            new-api-*.exe
+            checksums-windows.txt
+            if-no-files-found: error
+
+      - name: Publish rolling release (main only)
+        if: env.PUBLISH_RELEASE == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          EXE=$(ls new-api-*.exe | head -1)
+          # Stable download URL: always attached as new-api-patched-windows.exe
+          cp "$EXE" new-api-patched-windows.exe
+          sha256sum new-api-patched-windows.exe > checksums-windows.txt
+          cat > release-notes.md <<NOTES
+          ### Windows patched build (main)
+
+          - Commit: \`${GITHUB_SHA}\`
+          - Built: $(date -u +"%Y-%m-%d %H:%M UTC")
+          - Version string: \`${EXE%.exe}\`
+
+          **Download:** the asset \`new-api-patched-windows.exe\` below (stable filename).
+          Direct link: https://github.com/${GITHUB_REPOSITORY}/releases/latest/download/new-api-patched-windows.exe
+          NOTES
+          # Delete the rolling tag/release if present, then recreate so assets never accumulate stale copies
+          gh release delete patched-latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create patched-latest             --title "Patched Windows build (main, rolling)"             --notes-file release-notes.md             new-api-patched-windows.exe checksums-windows.txt

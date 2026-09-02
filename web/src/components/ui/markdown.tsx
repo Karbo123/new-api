@@ -734,14 +734,30 @@ function addExternalLinkAttributes(html: string): string {
   return template.innerHTML
 }
 
-function renderMarkdown(markdown: string, breaks = false): string {
-  const parsedHtml = markdownParser.parse(markdown, {
-    ...markdownOptions,
-    breaks,
-  })
-  const html = DOMPurify.sanitize(parsedHtml, sanitizeOptions)
+function escapeHtmlText(text: string): string {
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+}
 
-  return addExternalLinkAttributes(html)
+function renderMarkdown(markdown: string, breaks = false): string {
+  try {
+    const parsedHtml = markdownParser.parse(markdown, {
+      ...markdownOptions,
+      breaks,
+    })
+    const html = DOMPurify.sanitize(parsedHtml, sanitizeOptions)
+
+    return addExternalLinkAttributes(html)
+  } catch {
+    // marked's recursive inline/list renderers can overflow the call stack on
+    // pathological inputs (e.g. thousands of nested list markers from pasted
+    // terminal logs). Fall back to escaped plain text so one bad message can
+    // never take down the whole page.
+    return `<pre class="whitespace-pre-wrap break-words">${escapeHtmlText(markdown)}</pre>`
+  }
 }
 
 export function Markdown(props: MarkdownProps) {

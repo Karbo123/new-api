@@ -59,6 +59,7 @@ export const Response = memo((props: ResponseProps) => {
   const parserId = props.parserId ?? DEFAULT_PARSER_ID
   const markdown = getCachedMarkdown(parserId)
   const shouldParseMarkdown = content.length <= MAX_PARSED_MARKDOWN_CHARS
+  const parseFailureRef = useRef(false)
   const fadeStateRef = useRef<FadeState | null>(null)
   if (fadeStateRef.current == null) {
     fadeStateRef.current = createFadeState()
@@ -69,10 +70,19 @@ export const Response = memo((props: ResponseProps) => {
       return []
     }
 
-    return parseMarkdownToStructure(content, markdown, {
-      final: isFinal,
-      validateLink: markdown.options.validateLink,
-    })
+    try {
+      return parseMarkdownToStructure(content, markdown, {
+        final: isFinal,
+        validateLink: markdown.options.validateLink,
+      })
+    } catch (error) {
+      // Pathological markdown (e.g. deeply nested list markers from pasted
+      // terminal logs) can overflow the parser's recursion. Log and degrade
+      // to plain text instead of crashing the whole page.
+      console.error('[Response] markdown parse failed, falling back to plain text:', error)
+      parseFailureRef.current = true
+      return []
+    }
   }, [content, isFinal, markdown, shouldParseMarkdown])
   const parsedContent = useMemo(() => parseResponseContent(nodes), [nodes])
 
@@ -94,7 +104,12 @@ export const Response = memo((props: ResponseProps) => {
       footnotes = renderFootnotes(parsedContent.footnotes)
     }
   } else {
-    renderedContent = content
+    renderedContent =
+      shouldParseMarkdown && parseFailureRef.current ? (
+        <pre className='whitespace-pre-wrap break-words'>{content}</pre>
+      ) : (
+        content
+      )
     footnotes = renderFootnotes(parsedContent.footnotes)
   }
 

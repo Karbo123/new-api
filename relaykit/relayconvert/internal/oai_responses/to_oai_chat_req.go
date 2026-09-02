@@ -163,17 +163,77 @@ func responsesRequestMessagesToChat(req *dto.OpenAIResponsesRequest) ([]dto.Mess
 		if err := kitutil.Unmarshal(req.Input, &items); err != nil {
 			return nil, fmt.Errorf("invalid input array: %w", err)
 		}
+		// Thinking-mode upstreams (e.g. DeepSeek V4 via OpenCode Zen) reject follow-up
+		// turns with 400 "reasoning must be passed back" when the assistant history
+		// loses its reasoning text. Reasoning output items echoed by the client are
+		// therefore re-attached as reasoning_content on the next assistant message.
+		pendingReasoning := ""
 		for _, item := range items {
+			if strings.TrimSpace(kitutil.Interface2String(item["type"])) == "reasoning" {
+				if text := responsesReasoningItemText(item); text != "" {
+					if pendingReasoning != "" {
+						pendingReasoning += "\n\n"
+					}
+					pendingReasoning += text
+				}
+				continue
+			}
 			nextMessages, err := responsesInputItemToChatMessages(item, messages)
 			if err != nil {
 				return nil, err
 			}
 			messages = nextMessages
+			if pendingReasoning != "" && len(messages) > 0 {
+				if idx := len(messages) - 1; messages[idx].Role == "assistant" && messages[idx].GetReasoningContent() == "" {
+					messages[idx].ReasoningContent = kitutil.GetPointer(pendingReasoning)
+					pendingReasoning = ""
+				}
+			}
 		}
 		return messages, nil
 	default:
 		return nil, fmt.Errorf("unsupported responses input type %q", kitutil.GetJsonType(req.Input))
 	}
+}
+
+func responsesReasoningItemText(item map[string]any) string {
+	// Prefer raw reasoning text (`content`, type reasoning_text) over summarized forms,
+	// so the upstream receives the exact text it originally produced.
+	if text := responsesReasoningPartsText(item["content"], false); text != "" {
+		return text
+	}
+	if text := responsesReasoningPartsText(item["summary"], false); text != "" {
+		return text
+	}
+	return responsesReasoningPartsText(item["reasoning_details"], true)
+}
+
+func responsesReasoningPartsText(raw any, textTypeOnly bool) string {
+	parts, ok := raw.([]any)
+	if !ok {
+		return ""
+	}
+	var sb strings.Builder
+	seen := make(map[string]bool)
+	for _, rawPart := range parts {
+		part, ok := rawPart.(map[string]any)
+		if !ok {
+			continue
+		}
+		if textTypeOnly {
+			partType := strings.TrimSpace(kitutil.Interface2String(part["type"]))
+			if partType != "" && partType != "reasoning.text" && partType != "reasoning_text" {
+				continue
+			}
+		}
+		text := kitutil.Interface2String(part["text"])
+		if text == "" || seen[text] {
+			continue
+		}
+		seen[text] = true
+		sb.WriteString(text)
+	}
+	return sb.String()
 }
 
 func responsesInputItemToChatMessages(item map[string]any, messages []dto.Message) ([]dto.Message, error) {
@@ -205,7 +265,19 @@ func responsesInputItemToChatMessages(item map[string]any, messages []dto.Messag
 	if err != nil {
 		return nil, err
 	}
-	return append(messages, dto.Message{Role: role, Content: content}), nil
+	message := dto.Message{Role: role, Content: content}
+	if role == "assistant" {
+		// Some clients inline the reasoning text into the assistant item itself.
+		// Note: item["content"] is the message body here, never a reasoning source.
+		if rc := kitutil.Interface2String(item["reasoning_content"]); rc != "" {
+			message.ReasoningContent = kitutil.GetPointer(rc)
+		} else if rc := kitutil.Interface2String(item["reasoning"]); rc != "" {
+			message.ReasoningContent = kitutil.GetPointer(rc)
+		} else if rc := responsesReasoningPartsText(item["summary"], false); rc != "" {
+			message.ReasoningContent = kitutil.GetPointer(rc)
+		}
+	}
+	return append(messages, message), nil
 }
 
 func responsesInputContentToChatContent(content any) (any, error) {
