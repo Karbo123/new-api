@@ -1,0 +1,57 @@
+name: Build Windows exe (patched)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: Windows Release
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine Version
+        run: |
+          VERSION=$(git describe --tags)
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.0'
+
+      - name: Build Frontend
+        env:
+          CI: ""
+        run: |
+          cd web
+          bun install --frozen-lockfile
+          DISABLE_ESLINT_PLUGIN='true' VITE_REACT_APP_VERSION=$VERSION bun run build
+          cd ..
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '>=1.25.1'
+
+      - name: Build Backend
+        run: |
+          go mod download
+          go build -ldflags "-s -w -X 'github.com/QuantumNous/new-api/common.Version=$VERSION'" -o new-api-$VERSION-patched.exe
+
+      - name: Generate checksums
+        run: sha256sum new-api-*.exe > checksums-windows.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: |
+            new-api-*.exe
+            checksums-windows.txt
+            if-no-files-found: error
