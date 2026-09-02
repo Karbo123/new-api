@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -13,7 +14,17 @@ import (
 	"github.com/google/uuid"
 )
 
-const RefreshCookieName = "new_api_refresh"
+// RefreshCookieName 按监听端口隔离命名。cookie 规范不区分端口：同一浏览器里
+// 3000 生产实例与 3210 等测试实例共用主机 cookie 罐，互写 refresh token 而
+// 双方会话库互不认账，静默重登会把冲突放大成两个标签页互踢登录的死循环。
+// 3000（默认端口）保持原名，存量会话不受影响；其余端口自动加后缀隔离。
+var RefreshCookieName = sync.OnceValue(func() string {
+	port := common.ListenPort()
+	if port == "3000" {
+		return "new_api_refresh"
+	}
+	return "new_api_refresh_" + port
+})
 
 var (
 	ErrLoginSessionInvalid  = errors.New("login session is invalid")
@@ -70,7 +81,20 @@ func createLoginSession(userID int, expectedAuthVersion int64, loginMethod, ip, 
 		return nil, err
 	}
 	if activeCount >= int64(common.UserSessionActiveLimit) {
-		return nil, model.ErrUserSessionLimit
+		// 配额满先淘汰最后活跃超过 24h 的陈旧会话腾位（见 EvictOldestIdleSessions）：
+		// 旧库文件可能带着满额历史会话，不这样第一次登录就被挡。全部会话都
+		// 近期活跃（真活跃/失控循环）时仍然 409，且 24h 发放频率限额不受影响。
+		if _, err := model.EvictOldestIdleSessions(userID,
+			activeCount-int64(common.UserSessionActiveLimit)+1, now, 86400); err != nil {
+			return nil, err
+		}
+		activeCount, err = model.CountActiveUserSessions(userID, now)
+		if err != nil {
+			return nil, err
+		}
+		if activeCount >= int64(common.UserSessionActiveLimit) {
+			return nil, model.ErrUserSessionLimit
+		}
 	}
 	issuanceCount, err := model.CountUserSessionsCreatedSince(userID, now-common.UserSessionIssuanceWindowSeconds)
 	if err != nil {
@@ -249,6 +273,11 @@ func RefreshLoginSession(rawRefreshToken, expectedSID, ip, userAgent string) (*A
 		if errors.Is(err, model.ErrUserSessionRefreshRace) {
 			return nil, nil, ErrRefreshRace
 		}
+		if errors.Is(err, model.ErrUserSessionInactive) {
+			// 刷新入口缓存命中 active 后 DB 行被并发撤销（如空闲淘汰/手动吊销）：
+			// 按撤销语义回 401 并让控制器清 cookie，不能透传成 500。
+			return nil, nil, ErrLoginSessionRevoked
+		}
 		return nil, nil, err
 	}
 	rotated.IP = truncateAuthMetadata(ip, 64)
@@ -301,7 +330,7 @@ func WriteRefreshCookie(c *gin.Context, rawToken string) {
 		maxAge = 1
 	}
 	http.SetCookie(c.Writer, &http.Cookie{
-		Name:     RefreshCookieName,
+		Name:     RefreshCookieName(),
 		Value:    rawToken,
 		Path:     "/api/user/auth",
 		MaxAge:   maxAge,
@@ -314,7 +343,7 @@ func WriteRefreshCookie(c *gin.Context, rawToken string) {
 
 func ClearRefreshCookie(c *gin.Context) {
 	http.SetCookie(c.Writer, &http.Cookie{
-		Name:     RefreshCookieName,
+		Name:     RefreshCookieName(),
 		Value:    "",
 		Path:     "/api/user/auth",
 		MaxAge:   -1,

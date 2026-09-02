@@ -169,7 +169,7 @@ func TextHelper(c *gin.Context, info *relaycommon.RelayInfo) (newAPIError *types
 		}
 
 		// apply param override
-		if len(info.ParamOverride) > 0 {
+		if relaycommon.ShouldApplyParamOverrideWithRelayInfo(info) {
 			jsonData, err = relaycommon.ApplyParamOverrideWithRelayInfo(jsonData, info)
 			if err != nil {
 				return newAPIErrorFromParamOverride(err)

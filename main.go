@@ -204,10 +204,7 @@ func main() {
 		BuildFS:   buildFS,
 		IndexPage: indexPage,
 	})
-	var port = os.Getenv("PORT")
-	if port == "" {
-		port = strconv.Itoa(*common.Port)
-	}
+	var port = common.ListenPort()
 
 	srv := &http.Server{
 		Addr:    ":" + port,

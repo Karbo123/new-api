@@ -93,6 +93,8 @@ For commercial licensing, please contact support@quantumnous.com
   }
   html {
     @apply overflow-x-hidden font-sans;
+    /* 纵向滚动条出现/消失时不挤压布局宽度，避免内容横向跳动 */
+    scrollbar-gutter: stable;
   }
   body {
     @apply bg-background text-foreground has-[div[data-variant='inset']]:bg-sidebar min-h-svh w-full;

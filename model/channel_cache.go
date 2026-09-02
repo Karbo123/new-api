@@ -114,6 +114,12 @@ func SyncChannelCache(frequency int) {
 	}
 }
 
+// ChannelRoutingHook 若非 nil，返回该模型按外部顺序（如比价实际价升序）排列的
+// 渠道 ID。命中时第 retry 次尝试取顺序里第 retry 个候选渠道（确定性首选，故障才
+// 顺次降级），替代默认的「同优先级层按权重逐请求随机」——随机漂移会让多轮会话在
+// 渠道间来回切换，上游按端点隔离的前缀缓存全部失效。
+var ChannelRoutingHook func(model string) []int
+
 func GetRandomSatisfiedChannel(
 	group string,
 	model string,
@@ -139,6 +145,14 @@ func GetRandomSatisfiedChannel(
 
 	if len(channels) == 0 {
 		return nil, nil
+	}
+
+	if ChannelRoutingHook != nil {
+		if id := pickRoutedChannelID(channels, ChannelRoutingHook(model), retry); id != 0 {
+			if channel, ok := channelsIDM[id]; ok {
+				return channel, nil
+			}
+		}
 	}
 
 	if len(channels) == 1 {
@@ -214,6 +228,29 @@ func GetRandomSatisfiedChannel(
 	}
 	// return null if no channel is not found
 	return nil, errors.New("channel not found")
+}
+
+// pickRoutedChannelID 在候选渠道里按给定顺序取第 retry 个（order 中不在候选内的
+// 渠道被跳过）；顺序耗尽返回 0，由调用方落回默认的层级+权重逻辑。
+func pickRoutedChannelID(candidates []int, order []int, retry int) int {
+	if len(order) == 0 {
+		return 0
+	}
+	set := make(map[int]bool, len(candidates))
+	for _, id := range candidates {
+		set[id] = true
+	}
+	n := 0
+	for _, id := range order {
+		if !set[id] {
+			continue
+		}
+		if n == retry {
+			return id
+		}
+		n++
+	}
+	return 0
 }
 
 func CacheGetChannel(id int) (*Channel, error) {

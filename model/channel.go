@@ -202,6 +202,18 @@ func (channel *Channel) GetKeys() []string {
 }
 
 func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
+	return channel.getNextEnabledKeyIdx(nil)
+}
+
+// GetNextEnabledKeyForModel 按模型偏好选 key：preferred 是「可见该上游模型的
+// key 下标」集合（比价面板逐 key /v1/models 探测发布，nil=不感知）。在
+// 「启用 ∩ 可见」里按原模式轮询/随机；交集为空时回退全量启用集——可见性
+// 数据可能滞后于上游分组调整，宁可多试一次也不因数据过期拒绝服务。
+func (channel *Channel) GetNextEnabledKeyForModel(preferred map[int]bool) (string, int, *types.NewAPIError) {
+	return channel.getNextEnabledKeyIdx(preferred)
+}
+
+func (channel *Channel) getNextEnabledKeyIdx(preferred map[int]bool) (string, int, *types.NewAPIError) {
 	// If not in multi-key mode, return the original key string directly.
 	if !channel.ChannelInfo.IsMultiKey {
 		return channel.Key, 0, nil
@@ -244,6 +256,21 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 		return "", 0, types.NewError(errors.New("no enabled keys"), types.ErrorCodeChannelNoAvailableKey)
 	}
 
+	// 模型可见性偏好：收窄到「启用 ∩ 可见该模型」；空交集回退全量启用集
+	narrowed := false
+	if len(preferred) > 0 {
+		both := enabledIdx[:0]
+		for _, i := range enabledIdx {
+			if preferred[i] {
+				both = append(both, i)
+			}
+		}
+		if len(both) > 0 {
+			enabledIdx = both
+			narrowed = true
+		}
+	}
+
 	switch channel.ChannelInfo.MultiKeyMode {
 	case constant.MultiKeyModeRandom:
 		// Randomly pick one enabled key
@@ -273,7 +300,8 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 		}
 		for i := 0; i < len(keys); i++ {
 			idx := (start + i) % len(keys)
-			if getStatus(idx) == common.ChannelStatusEnabled {
+			// 收窄时按「启用 ∩ 可见」判定；未收窄保持基线 getStatus 直查（免多余 map 分配）
+			if getStatus(idx) == common.ChannelStatusEnabled && (!narrowed || preferred[idx]) {
 				// update polling index for next call (point to the next position)
 				channel.ChannelInfo.MultiKeyPollingIndex = (idx + 1) % len(keys)
 				return keys[idx], idx, nil

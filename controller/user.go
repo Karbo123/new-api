@@ -142,6 +142,37 @@ func Login(c *gin.Context) {
 	setupLogin(&user, c)
 }
 
+// LocalAutoLogin 本机免密登录：LOCAL_AUTH_BYPASS 开启时（默认开启），来自
+// 回环地址且 Host 为本机的请求直接以最高权限用户身份进入控制台。
+// 必须走与密码登录相同的 setupLogin（持久 user_session + refresh cookie）：
+// access token 只有约 8 分钟寿命，此前只发短时 token 不落会话，过期后
+// 无会话可刷新，必然被 401 踢回登录页再静默重登，形成免密跳转循环。
+// 会话额度消耗为每次免密进入 1 个会话，配合会话清理与限额兜底可接受。
+// 响应结构与密码登录一致，前端拿到后静默进入控制台。
+func LocalAutoLogin(c *gin.Context) {
+	if !common.LocalAuthBypass || !common.IsLoopbackRequest(c.Request) {
+		c.JSON(http.StatusForbidden, gin.H{"success": false,
+			"message": "local auth bypass is disabled or request is not from loopback"})
+		return
+	}
+	userId, err := model.GetEnabledUserIdByRole(common.RoleAdminUser)
+	if err != nil {
+		common.SysLog(fmt.Sprintf("LocalAutoLogin database error: %v", err))
+		common.ApiErrorI18n(c, i18n.MsgDatabaseError)
+		return
+	}
+	if userId == 0 {
+		common.ApiErrorI18n(c, i18n.MsgAuthUserBanned)
+		return
+	}
+	user, err := model.GetUserById(userId, false)
+	if err != nil || user == nil || user.Status != common.UserStatusEnabled || user.AuthVersion <= 0 {
+		common.ApiErrorI18n(c, i18n.MsgAuthUserBanned)
+		return
+	}
+	setupLogin(user, c)
+}
+
 // loginMethodFromContext 根据请求路径推导登录方式，用于登录审计日志。
 func loginMethodFromContext(c *gin.Context) string {
 	switch c.FullPath() {
@@ -151,6 +182,8 @@ func loginMethodFromContext(c *gin.Context) string {
 		return "2fa"
 	case "/api/user/passkey/login/finish":
 		return "passkey"
+	case "/api/user/local_auto_login":
+		return "local_bypass"
 	case "/api/oauth/wechat":
 		return "wechat"
 	case "/api/oauth/telegram/login":

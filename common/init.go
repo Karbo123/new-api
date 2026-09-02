@@ -22,6 +22,17 @@ var (
 	LogDir       = flag.String("log-dir", "./logs", "specify the log directory")
 )
 
+// ListenPort 返回实际监听端口：PORT 环境变量优先，其次 --port flag。
+// main.go 启动监听、refresh cookie 按端口隔离、比价 harness 的本机地址共用
+// 同一规则，三处各自复制会导致端口判定漂移（例如测试实例拿到 3000 语义）。
+func ListenPort() string {
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = strconv.Itoa(*Port)
+	}
+	return port
+}
+
 func printHelp() {
 	fmt.Println("NewAPI(Based OneAPI) " + Version + " - The next-generation LLM gateway and AI asset management system supports multiple languages.")
 	fmt.Println("Original Project: OneAPI by JustSong - https://github.com/songquanpeng/one-api")
@@ -121,7 +132,9 @@ func InitEnv() {
 
 	// Initialize rate limit variables
 	GlobalApiRateLimitEnable = GetEnvOrDefaultBool("GLOBAL_API_RATE_LIMIT_ENABLE", true)
-	GlobalApiRateLimitNum = GetEnvOrDefault("GLOBAL_API_RATE_LIMIT", 360)
+	// 本机单用户自托管默认值：360/180s 易被登录级联+比价面板轮询瞬时打满（429），
+	// 提到 1200 仍能兜底真正的失控循环；环境变量仍可覆盖
+	GlobalApiRateLimitNum = GetEnvOrDefault("GLOBAL_API_RATE_LIMIT", 1200)
 	GlobalApiRateLimitDuration = int64(GetEnvOrDefault("GLOBAL_API_RATE_LIMIT_DURATION", 180))
 
 	GlobalWebRateLimitEnable = GetEnvOrDefaultBool("GLOBAL_WEB_RATE_LIMIT_ENABLE", true)
@@ -129,7 +142,10 @@ func InitEnv() {
 	GlobalWebRateLimitDuration = int64(GetEnvOrDefault("GLOBAL_WEB_RATE_LIMIT_DURATION", 180))
 
 	CriticalRateLimitEnable = GetEnvOrDefaultBool("CRITICAL_RATE_LIMIT_ENABLE", true)
-	CriticalRateLimitNum = GetEnvOrDefault("CRITICAL_RATE_LIMIT", 20)
+	// CT 桶罩着 auth/refresh、auth/logout 等会话端点：默认 20/20min 时单用户
+	// 正常开关页面+多标签就能打满（每次页面加载至少 1 次 refresh）→ 登录 429；
+	// 提到 200 仍能兜底真正的失控循环；环境变量仍可覆盖
+	CriticalRateLimitNum = GetEnvOrDefault("CRITICAL_RATE_LIMIT", 200)
 	CriticalRateLimitDuration = int64(GetEnvOrDefault("CRITICAL_RATE_LIMIT_DURATION", 20*60))
 
 	SearchRateLimitEnable = GetEnvOrDefaultBool("SEARCH_RATE_LIMIT_ENABLE", true)

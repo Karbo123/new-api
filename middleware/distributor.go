@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -640,7 +641,29 @@ func SetupContextForSelectedChannel(c *gin.Context, channel *model.Channel, mode
 	common.SetContextKey(c, constant.ContextKeyChannelModelMapping, channel.GetModelMapping())
 	common.SetContextKey(c, constant.ContextKeyChannelStatusCodeMapping, channel.GetStatusCodeMapping())
 
-	key, index, newAPIError := channel.GetNextEnabledKey()
+	// 多 key 渠道按模型选 key：比价面板的逐 key 可见性数据存在时，优先在
+	// 「可见该上游模型」的 key 里轮询，避免轮到分组里没有该模型的 key 白跑一趟
+	// （无可见性数据/单 key 渠道行为不变）
+	var (
+		key         string
+		index       int
+		newAPIError *types.NewAPIError
+	)
+	if channel.ChannelInfo.IsMultiKey {
+		upstreamModel := modelName
+		if mp := channel.GetModelMapping(); mp != "" {
+			var mapping map[string]string
+			if json.Unmarshal([]byte(mp), &mapping) == nil {
+				if v, ok := mapping[modelName]; ok && v != "" {
+					upstreamModel = v
+				}
+			}
+		}
+		key, index, newAPIError = channel.GetNextEnabledKeyForModel(
+			service.PreferredKeyIndexes(channel.Id, upstreamModel))
+	} else {
+		key, index, newAPIError = channel.GetNextEnabledKey()
+	}
 	if newAPIError != nil {
 		return newAPIError
 	}

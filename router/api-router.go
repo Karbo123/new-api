@@ -22,6 +22,8 @@ func SetApiRouter(router *gin.Engine) {
 	{
 		apiRouter.GET("/setup", controller.GetSetup)
 		apiRouter.POST("/setup", anonymousRequestBodyLimit, controller.PostSetup)
+		// 本机免密登录（LOCAL_AUTH_BYPASS，默认开启；端点内部校验回环地址+Host）
+		apiRouter.GET("/user/local_auto_login", controller.LocalAutoLogin)
 		apiRouter.GET("/status", controller.GetStatus)
 		apiRouter.GET("/uptime/status", controller.GetUptimeKumaStatus)
 		apiRouter.GET("/models", middleware.UserAuth(), controller.DashboardListModels)
@@ -152,6 +154,30 @@ func SetApiRouter(router *gin.Engine) {
 				adminRoute.GET("/2fa/stats", controller.Admin2FAStats)
 				adminRoute.DELETE("/:id/2fa", controller.AdminDisable2FA)
 			}
+		}
+
+		// 模型比价面板（管理员）
+		pcRoute := apiRouter.Group("/price_compare")
+		pcRoute.Use(middleware.AdminAuth())
+		{
+			pcRoute.GET("/overview", controller.GetPriceCompareOverview)
+			pcRoute.GET("/unified", controller.GetPriceCompareUnified)
+			pcRoute.GET("/priority", controller.GetPriceComparePriority)
+			pcRoute.POST("/priority", controller.PostPriceComparePriority)
+			pcRoute.POST("/refresh", controller.PostPriceCompareRefresh)
+			pcRoute.GET("/keys", controller.GetPriceCompareKeys)
+			pcRoute.GET("/keys/balance", controller.GetPriceCompareBalances)
+			pcRoute.GET("/keys/access", controller.GetPriceCompareKeyAccess)
+			pcRoute.POST("/test_offer", controller.PostPriceCompareTestOffer)
+			pcRoute.POST("/keys", controller.PostPriceCompareKeys)
+			pcRoute.POST("/keys/import", controller.PostPriceCompareKeysImport)
+			pcRoute.POST("/keys/purge", controller.PostPriceCompareKeysPurge)
+			pcRoute.POST("/auto_rule/apply", controller.PostPriceCompareAutoRuleApply)
+			pcRoute.GET("/providers", controller.GetPriceCompareProviders)
+			pcRoute.GET("/aliases", controller.GetPriceCompareAliases)
+			pcRoute.POST("/aliases", controller.PostPriceCompareAliases)
+			pcRoute.GET("/mapping", controller.GetPriceCompareMapping)
+			pcRoute.GET("/refresh/status", controller.GetPriceCompareRefreshStatus)
 		}
 
 		// Subscription billing (plans, purchase, admin management)
