@@ -45,6 +45,24 @@ func validUserInfo(username string, role int) bool {
 }
 
 func authHelper(c *gin.Context, minRole int) {
+	// 本机免登录：来自回环地址且 Host 为本机的请求，默认以最高权限用户放行
+	// （LOCAL_AUTH_BYPASS=false 关闭）。见 common/local_auth.go 的安全说明。
+	if common.LocalAuthBypass && common.IsLoopbackRequest(c.Request) {
+		if user := localBypassUser(minRole); user != nil {
+			setDashboardAuthContext(c, user,
+				service.AuthIdentity{UserID: user.Id, UserAuthVersion: user.AuthVersion}, false)
+			c.Set("local_bypass", true)
+			// 免密放行同样走管理/root 写操作审计兜底，与下方正常鉴权路径保持一致，
+			// 保证任何经过 AdminAuth/RootAuth 的写接口都会自动留痕。
+			var auditWriter *auditResponseWriter
+			if minRole >= common.RoleAdminUser {
+				auditWriter = beginAdminAudit(c)
+			}
+			c.Next()
+			finishAdminAudit(c, auditWriter)
+			return
+		}
+	}
 	user, identity, useAccessToken, err := authenticateDashboardRequest(c)
 	if err != nil {
 		writeDashboardAuthError(c, err)
@@ -136,6 +154,27 @@ func GetSessionAuthIdentity(c *gin.Context) (service.AuthIdentity, bool) {
 		return service.AuthIdentity{}, false
 	}
 	return identity, true
+}
+
+// localBypassUser 取一个满足 minRole 的启用用户（权限最高者优先，root 优先）。
+// 查询失败时返回 nil，回退到正常鉴权（fail-safe），仅记录日志辅助排障。
+func localBypassUser(minRole int) *model.UserBase {
+	if model.DB == nil {
+		return nil
+	}
+	userId, err := model.GetEnabledUserIdByRole(minRole)
+	if err != nil {
+		common.SysLog(fmt.Sprintf("localBypassUser database error: %v", err))
+		return nil
+	}
+	if userId == 0 {
+		return nil
+	}
+	user, err := model.GetUserCache(userId)
+	if err != nil || user == nil || user.Status != common.UserStatusEnabled {
+		return nil
+	}
+	return user
 }
 
 func authenticateDashboardRequest(c *gin.Context) (*model.UserBase, service.AuthIdentity, bool, error) {

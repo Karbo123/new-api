@@ -117,6 +117,17 @@ func GetChannel(
 		return nil, err
 	}
 	abilities = filterAbilitiesByConstraints(abilities, model, filters)
+	if ChannelRoutingHook != nil {
+		ids := make([]int, 0, len(abilities))
+		for _, ability := range abilities {
+			ids = append(ids, ability.ChannelId)
+		}
+		if id := pickRoutedChannelID(ids, ChannelRoutingHook(model), retry); id != 0 {
+			ch := Channel{}
+			err = DB.First(&ch, "id = ?", id).Error
+			return &ch, err
+		}
+	}
 	if len(abilities) > 0 {
 		priorities := make([]int64, 0)
 		seen := make(map[int64]bool)

@@ -27,6 +27,31 @@ const (
 
 var errSourceHeaderNotFound = errors.New("source header does not exist")
 
+// ProviderOrderHook 由比价模块注入（controller 包 init 赋值，避免反向依赖）：
+// 按重试轮次返回发往 OpenRouter 的供应商顺序与是否允许 OR 自行兜底。混合跨渠道
+// 顺序（如 OR→OpenCode→OR）按阶段精确交错——每个 OR 阶段只注入该阶段的端点并
+// 禁止 OR 内部兜底（失败交给 new-api 重试进下一阶段），末位阶段才放开兜底。
+var ProviderOrderHook func(upstreamModel string, retry int, channelId int) (order []string, allowFallback bool)
+
+// injectProviderOrder 把供应商顺序写进请求体；请求体自带 provider.order 时尊重请求不覆盖。
+// 存在性检查必须基于 param_override 应用前的 originalJSON：legacy param_override 会把顶层
+// provider 对象整体替换（如比价接管写入的 {"sort":"price"}），先清掉用户自带的
+// provider.order/allow_fallbacks 后再检查被改写的结果，会误判为不存在而照常注入。
+func injectProviderOrder(originalJSON, jsonData []byte, order []string, allowFallback bool) []byte {
+	if gjson.GetBytes(originalJSON, "provider.order").Exists() {
+		return jsonData
+	}
+	result, err := sjson.SetBytes(jsonData, "provider.order", order)
+	if err != nil {
+		return jsonData
+	}
+	result, err = sjson.SetBytes(result, "provider.allow_fallbacks", allowFallback)
+	if err != nil {
+		return jsonData
+	}
+	return result
+}
+
 var paramOverrideSensitivePathPrefixes = []string{
 	"model",
 	"original_model",
@@ -183,19 +208,31 @@ func buildLegacyParamOverride(paramOverride map[string]interface{}) map[string]i
 
 func ApplyParamOverrideWithRelayInfo(jsonData []byte, info *RelayInfo) ([]byte, error) {
 	paramOverride := getParamOverrideMap(info)
-	if len(paramOverride) == 0 {
+	// provider.order 注入不依赖渠道配置 param_override：用户自建的 OpenRouter 渠道
+	// （无 param_override）也要按比价优先级列表注入，故两者任一命中才继续。
+	if !ShouldApplyParamOverrideWithRelayInfo(info) {
 		return jsonData, nil
 	}
 
 	overrideCtx := BuildParamOverrideContext(info)
 	var recorder *paramOverrideAuditRecorder
-	if shouldEnableParamOverrideAudit(paramOverride) {
+	if len(paramOverride) > 0 && shouldEnableParamOverrideAudit(paramOverride) {
 		recorder = &paramOverrideAuditRecorder{}
 		overrideCtx[paramOverrideContextAuditRecorder] = recorder
 	}
-	result, err := ApplyParamOverride(jsonData, paramOverride, overrideCtx)
-	if err != nil {
-		return nil, err
+	result := jsonData
+	if len(paramOverride) > 0 {
+		var err error
+		result, err = ApplyParamOverride(jsonData, paramOverride, overrideCtx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// 比价接管：发往 OpenRouter 的请求按优先级列表阶段注入 provider.order
+	if providerOrderApplicable(info) {
+		if order, allowFB := ProviderOrderHook(info.UpstreamModelName, info.RetryIndex, info.ChannelId); len(order) > 0 {
+			result = injectProviderOrder(jsonData, result, order, allowFB)
+		}
 	}
 	syncReasoningEffortAfterParamOverride(info, jsonData, result)
 	syncRuntimeHeaderOverrideFromContext(info, overrideCtx)
@@ -207,6 +244,22 @@ func ApplyParamOverrideWithRelayInfo(jsonData []byte, info *RelayInfo) ([]byte, 
 		}
 	}
 	return result, nil
+}
+
+// ShouldApplyParamOverrideWithRelayInfo 报告本次请求是否需要走 ApplyParamOverrideWithRelayInfo：
+// 渠道配置了 param_override，或比价接管需要向 OpenRouter 注入 provider.order——后者不要求
+// 渠道带 param_override（用户自建的 OpenRouter 渠道也要接管路由顺序），调用方不能仅凭
+// len(info.ParamOverride) > 0 跳过。
+func ShouldApplyParamOverrideWithRelayInfo(info *RelayInfo) bool {
+	if len(getParamOverrideMap(info)) > 0 {
+		return true
+	}
+	return providerOrderApplicable(info)
+}
+
+func providerOrderApplicable(info *RelayInfo) bool {
+	return ProviderOrderHook != nil && info != nil && info.ChannelMeta != nil &&
+		strings.Contains(info.ChannelBaseUrl, "openrouter.ai")
 }
 
 func syncReasoningEffortAfterParamOverride(info *RelayInfo, before, after []byte) {
@@ -554,6 +607,10 @@ func GetEffectiveHeaderOverride(info *RelayInfo) map[string]interface{} {
 	if info == nil {
 		return map[string]interface{}{}
 	}
+	// 运行时表是 param_override 操作后的完整头表快照（播种自已生效的头表，
+	// delete_header/set_header 空值删除的结果都体现在其中），必须整体替换：
+	// 若按 key 叠加回静态底表，被显式剥离的头（可能含敏感值）会复活并照发上游。
+	// 重试切换渠道时的旧快照问题由 InitChannelMeta 按 attempt 重置运行时状态解决。
 	if info.UseRuntimeHeadersOverride {
 		return sanitizeHeaderOverrideMap(info.RuntimeHeadersOverride)
 	}

@@ -232,6 +232,25 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		if newAPIError == nil {
 			relayInfo.LastError = nil
+			// 试探成功的欠费 key：清除自动停用标记（面板恢复「启用」，回到正常轮换）。
+			// 仅处理「仍在停用名单里且原因是欠费自动停用」的 key——手动停用的 key
+			// 不会被选中，这里天然不会误放行
+			if common.GetContextKeyBool(c, constant.ContextKeyChannelIsMultiKey) {
+				idx := common.GetContextKeyInt(c, constant.ContextKeyChannelMultiKeyIndex)
+				if channel.ChannelInfo.MultiKeyStatusList != nil {
+					if st, ok := channel.ChannelInfo.MultiKeyStatusList[idx]; ok &&
+						st != common.ChannelStatusEnabled &&
+						channel.ChannelInfo.MultiKeyDisabledReason[idx] == model.MultiKeyAutoDisableReason {
+						channelId := channel.Id
+						key := common.GetContextKeyString(c, constant.ContextKeyChannelKey)
+						gopool.Go(func() {
+							if model.UpdateChannelStatus(channelId, key, common.ChannelStatusEnabled, "auto key recovered") {
+								common.SysLog(fmt.Sprintf("multi-key auto-recover: channel #%d one key re-enabled after successful trial", channelId))
+							}
+						})
+					}
+				}
+			}
 			return
 		}
 
@@ -394,8 +413,44 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 	return operation_setting.ShouldRetryByStatusCode(code)
 }
 
+// pcIsInsufficientBalance 判定上游「欠费/余额不足」错误：多 key 渠道里这是单把
+// key 的临时状态（同渠道其他 key 可能有钱），链路须精准停用出错的那把 key 而非
+// 整个渠道——否则空模式选 key 永远撞第一把、其余 key 永远轮不到
+func pcIsInsufficientBalance(err *types.NewAPIError) bool {
+	if err == nil {
+		return false
+	}
+	if err.StatusCode == http.StatusPaymentRequired { // 402
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "insufficient balance") ||
+		strings.Contains(msg, "insufficient_quota") ||
+		strings.Contains(msg, "余额不足") ||
+		strings.Contains(msg, "欠费")
+}
+
 func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError, relayInfo *relaycommon.RelayInfo) {
 	logger.LogError(c, fmt.Sprintf("channel error (channel #%d, status code: %d): %s", channelError.ChannelId, err.StatusCode, common.LocalLogPreview(err.Error())))
+	// 欠费按 key 精准停用（多 key 渠道）：把出错的那把 key 标记停用，后续请求选 key
+	// 自动跳过它改用有钱的 key；全部 key 停用时 handlerMultiKeyUpdate 会把渠道一并
+	// 自动停用。充值后可在面板多 key 管理里重新启用该 key。
+	// 注意：不能信任 channelError.IsMultiKey——relay 的 getChannel 在 ChannelMeta
+	// 缺失时会构造丢 ChannelInfo 的裸渠道对象（IsMultiKey 恒 false），必须现查库；
+	// 单 key 渠道不走此分支，仍由全局「自动禁用渠道」开关决定，行为不变
+	if channelError.UsingKey != "" && pcIsInsufficientBalance(err) {
+		gopool.Go(func() {
+			ch, e := model.GetChannelById(channelError.ChannelId, false)
+			if e != nil || ch == nil || !ch.ChannelInfo.IsMultiKey {
+				return
+			}
+			if model.UpdateChannelStatus(channelError.ChannelId, channelError.UsingKey,
+				common.ChannelStatusManuallyDisabled, model.MultiKeyAutoDisableReason) {
+				common.SysLog(fmt.Sprintf("multi-key auto-disable: channel #%d one key marked disabled (insufficient balance, no key value logged)",
+					channelError.ChannelId))
+			}
+		})
+	}
 	// 不要使用context获取渠道信息，异步处理时可能会出现渠道信息不一致的情况
 	// do not use context to get channel info, there may be inconsistent channel info when processing asynchronously
 	if service.ShouldDisableChannel(err) && channelError.AutoBan {

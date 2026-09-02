@@ -132,6 +132,73 @@ func TestCreateLoginSessionEnforcesActiveLimitAcrossAuthVersions(t *testing.T) {
 	assert.Equal(t, int64(50), count)
 }
 
+func TestCreateLoginSessionEvictsOnlyIdleSessionsWhenLimitReached(t *testing.T) {
+	useTestSessionSecret(t)
+	user := setupAuthSessionTestDB(t)
+	common.UserSessionActiveLimit = 2
+	common.UserSessionIssuanceLimit = 100
+	now := time.Now().Unix()
+	rows := []model.UserSession{
+		{
+			// Created over 24h ago but kept alive by refresh rotation, which
+			// renews last_active_at: it must not be evicted.
+			SID: "kept-alive-session", UserID: user.Id, Version: 1, UserAuthVersion: user.AuthVersion,
+			Status: model.UserSessionStatusActive, RefreshHash: "hash-kept", LoginMethod: "password",
+			CreatedAt: now - 48*3600, LastActiveAt: now, ExpiresAt: now + 3600,
+		},
+		{
+			// Not renewed with a refresh for over 24h: a dead device, evictable.
+			SID: "idle-session", UserID: user.Id, Version: 1, UserAuthVersion: user.AuthVersion,
+			Status: model.UserSessionStatusActive, RefreshHash: "hash-idle", LoginMethod: "password",
+			CreatedAt: now - 48*3600, LastActiveAt: now - 25*3600, ExpiresAt: now + 3600,
+		},
+	}
+	require.NoError(t, model.DB.Create(&rows).Error)
+
+	bundle, err := CreateLoginSession(user.Id, "password", "127.0.0.1", "test-agent")
+	require.NoError(t, err, "evicting the idle session must free quota for the login")
+	assert.NotEqual(t, "idle-session", bundle.Session.SID)
+
+	kept, err := model.GetUserSessionBySID("kept-alive-session")
+	require.NoError(t, err)
+	assert.Equal(t, model.UserSessionStatusActive, kept.Status, "a session kept alive by refreshes must survive eviction")
+	evicted, err := model.GetUserSessionBySID("idle-session")
+	require.NoError(t, err)
+	assert.Equal(t, model.UserSessionStatusRevoked, evicted.Status)
+	assert.Positive(t, evicted.RevokedAt)
+}
+
+func TestEvictedSessionCacheIsDeniedImmediately(t *testing.T) {
+	useTestSessionSecret(t)
+	user := setupAuthSessionTestDB(t)
+	_, clientA, _, _ := useIndependentAuthSessionRedis(t)
+	common.UserSessionActiveLimit = 2
+	common.UserSessionIssuanceLimit = 100
+	common.RDB = clientA
+
+	bundle, err := CreateLoginSession(user.Id, "password", "127.0.0.1", "node-a")
+	require.NoError(t, err)
+	identity, err := ParseAccessToken(bundle.AccessToken)
+	require.NoError(t, err)
+	_, _, err = ValidateLoginSession(identity)
+	require.NoError(t, err)
+
+	// The session goes idle server-side: no refresh renewed last_active_at for
+	// over 24h, while its active cache entry is still warm.
+	require.NoError(t, model.DB.Model(&model.UserSession{}).Where("sid = ?", bundle.Session.SID).
+		Update("last_active_at", time.Now().Unix()-25*3600).Error)
+
+	_, err = CreateLoginSession(user.Id, "password", "127.0.0.1", "node-b")
+	require.NoError(t, err)
+	_, err = CreateLoginSession(user.Id, "password", "127.0.0.1", "node-c")
+	require.NoError(t, err, "evicting the idle session must free quota for the third login")
+
+	// The deny tombstone must reject the evicted session's access token
+	// immediately, without waiting for the cache TTL to expire.
+	_, _, err = ValidateLoginSession(identity)
+	assert.ErrorIs(t, err, ErrLoginSessionRevoked)
+}
+
 func TestCreateLoginSessionEnforcesIssuanceLimitAcrossAllStatuses(t *testing.T) {
 	useTestSessionSecret(t)
 	user := setupAuthSessionTestDB(t)

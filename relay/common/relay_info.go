@@ -248,6 +248,12 @@ func (info *RelayInfo) InitChannelMeta(c *gin.Context) {
 
 	info.ChannelMeta = channelMeta
 
+	// RuntimeHeadersOverride 是上一 attempt 在 param_override 执行后锁存的头表快照，
+	// 只属于当时的渠道；重试切换渠道后必须作废，让新渠道从自身 header_override
+	// 重新出发，避免旧渠道的头（可能含凭证类值）泄漏给新渠道的上游。
+	info.RuntimeHeadersOverride = nil
+	info.UseRuntimeHeadersOverride = false
+
 	// Channel identity feeds the converter options snapshot (e.g.
 	// OpenRouterDialect); drop the cache so a cross-channel retry rebuilds it.
 	info.convOptions = nil

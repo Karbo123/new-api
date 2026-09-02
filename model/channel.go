@@ -20,6 +20,14 @@ import (
 	"gorm.io/gorm/clause"
 )
 
+// MultiKeyAutoDisableReason 欠费自动停用 key 的标记原因：402 处理（controller）
+// 与试探恢复（getNextEnabledKeyIdx）共用同一字符串，改文案必须两处一致
+const MultiKeyAutoDisableReason = "insufficient balance (auto key-disable)"
+
+// multiKeyProbationSeconds 欠费自动停用的 key 经过多久放回轮换试探一次：
+// 充值后无需人工干预即可自动恢复使用；仍欠费则被 402 路径重新计时
+const multiKeyProbationSeconds = 300
+
 type Channel struct {
 	Id                 int     `json:"id"`
 	Type               int     `json:"type" gorm:"default:0"`
@@ -202,6 +210,18 @@ func (channel *Channel) GetKeys() []string {
 }
 
 func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
+	return channel.getNextEnabledKeyIdx(nil)
+}
+
+// GetNextEnabledKeyForModel 按模型偏好选 key：preferred 是「可见该上游模型的
+// key 下标」集合（比价面板逐 key /v1/models 探测发布，nil=不感知）。在
+// 「启用 ∩ 可见」里按原模式轮询/随机；交集为空时回退全量启用集——可见性
+// 数据可能滞后于上游分组调整，宁可多试一次也不因数据过期拒绝服务。
+func (channel *Channel) GetNextEnabledKeyForModel(preferred map[int]bool) (string, int, *types.NewAPIError) {
+	return channel.getNextEnabledKeyIdx(preferred)
+}
+
+func (channel *Channel) getNextEnabledKeyIdx(preferred map[int]bool) (string, int, *types.NewAPIError) {
 	// If not in multi-key mode, return the original key string directly.
 	if !channel.ChannelInfo.IsMultiKey {
 		return channel.Key, 0, nil
@@ -224,10 +244,34 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 		if statusList == nil {
 			return common.ChannelStatusEnabled
 		}
-		if status, ok := statusList[idx]; ok {
-			return status
+		status, ok := statusList[idx]
+		if !ok {
+			return common.ChannelStatusEnabled
 		}
-		return common.ChannelStatusEnabled
+		// 欠费自动停用的 key 超过试探窗口后放回轮换：充值后无需人工干预即可恢复
+		// 使用（本轮成功会清除停用标记；仍欠费则被 402 路径重新标记计时）
+		if status != common.ChannelStatusEnabled &&
+			channel.ChannelInfo.MultiKeyDisabledReason[idx] == MultiKeyAutoDisableReason {
+			if t := channel.ChannelInfo.MultiKeyDisabledTime[idx]; t > 0 && common.GetTimestamp()-t >= multiKeyProbationSeconds {
+				return common.ChannelStatusEnabled
+			}
+		}
+		return status
+	}
+	// 选中一把「仍在停用名单里」的欠费 key 即一次试探：立即刷新停用时间，
+	// 若本次仍失败，下一个窗口（multiKeyProbationSeconds）后才会再试
+	pickKey := func(idx int) (string, int, *types.NewAPIError) {
+		if statusList != nil {
+			if st, ok := statusList[idx]; ok && st != common.ChannelStatusEnabled &&
+				channel.ChannelInfo.MultiKeyDisabledReason[idx] == MultiKeyAutoDisableReason {
+				if channel.ChannelInfo.MultiKeyDisabledTime == nil {
+					channel.ChannelInfo.MultiKeyDisabledTime = make(map[int]int64)
+				}
+				channel.ChannelInfo.MultiKeyDisabledTime[idx] = common.GetTimestamp()
+				_ = channel.SaveChannelInfo()
+			}
+		}
+		return keys[idx], idx, nil
 	}
 
 	// Collect indexes of enabled keys
@@ -244,11 +288,26 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 		return "", 0, types.NewError(errors.New("no enabled keys"), types.ErrorCodeChannelNoAvailableKey)
 	}
 
+	// 模型可见性偏好：收窄到「启用 ∩ 可见该模型」；空交集回退全量启用集
+	narrowed := false
+	if len(preferred) > 0 {
+		both := enabledIdx[:0]
+		for _, i := range enabledIdx {
+			if preferred[i] {
+				both = append(both, i)
+			}
+		}
+		if len(both) > 0 {
+			enabledIdx = both
+			narrowed = true
+		}
+	}
+
 	switch channel.ChannelInfo.MultiKeyMode {
 	case constant.MultiKeyModeRandom:
 		// Randomly pick one enabled key
 		selectedIdx := enabledIdx[rand.Intn(len(enabledIdx))]
-		return keys[selectedIdx], selectedIdx, nil
+		return pickKey(selectedIdx)
 	case constant.MultiKeyModePolling:
 		// Use channel-specific lock to ensure thread-safe polling
 
@@ -273,17 +332,18 @@ func (channel *Channel) GetNextEnabledKey() (string, int, *types.NewAPIError) {
 		}
 		for i := 0; i < len(keys); i++ {
 			idx := (start + i) % len(keys)
-			if getStatus(idx) == common.ChannelStatusEnabled {
+			// 收窄时按「启用 ∩ 可见」判定；未收窄保持基线 getStatus 直查（免多余 map 分配）
+			if getStatus(idx) == common.ChannelStatusEnabled && (!narrowed || preferred[idx]) {
 				// update polling index for next call (point to the next position)
 				channel.ChannelInfo.MultiKeyPollingIndex = (idx + 1) % len(keys)
-				return keys[idx], idx, nil
+				return pickKey(idx)
 			}
 		}
 		// Fallback – should not happen, but return first enabled key
-		return keys[enabledIdx[0]], enabledIdx[0], nil
+		return pickKey(enabledIdx[0])
 	default:
 		// Unknown mode, default to first enabled key (or original key string)
-		return keys[enabledIdx[0]], enabledIdx[0], nil
+		return pickKey(enabledIdx[0])
 	}
 }
 

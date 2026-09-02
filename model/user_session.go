@@ -180,6 +180,54 @@ func CountActiveUserSessions(userID int, now int64) (int64, error) {
 	return count, err
 }
 
+// EvictOldestIdleSessions 淘汰该用户最后活跃于 idleSeconds 之前的活跃会话（最久
+// 未活跃优先），腾出至少 room 个名额。仅当活跃配额打满时由登录路径调用：access
+// token 只有几分钟寿命，超过一天没有随刷新续期的会话都是死设备，淘汰无感——
+// 刷新轮换续期的是 last_active_at，持续保活的会话不会被误杀；失控循环产生的
+// 全是新鲜会话，不会被这里放行——上限的报警语义不变。
+// 旧库文件可能带着满额历史会话，不这样开门第一次登录就被挡。
+func EvictOldestIdleSessions(userID int, room int64, now int64, idleSeconds int64) (int64, error) {
+	if userID <= 0 || room <= 0 {
+		return 0, nil
+	}
+	if now <= 0 {
+		now = time.Now().Unix()
+	}
+	var candidates []UserSession
+	err := DB.Where(
+		"user_id = ? AND status = ? AND expires_at > ? AND last_active_at < ?",
+		userID, UserSessionStatusActive, now, now-idleSeconds,
+	).Order("last_active_at ASC").Limit(int(room)).Find(&candidates).Error
+	if err != nil || len(candidates) == 0 {
+		return 0, err
+	}
+	// 与其余撤销路径一致：先发布否定墓碑掐掉 active 缓存条目（否则被淘汰会话
+	// 已签发的 access token 会在缓存 TTL 内继续判活），再落库撤销。
+	for i := range candidates {
+		if err := writeUserSessionDenyFence(&candidates[i], UserSessionStatusRevoking, now, "idle_evicted"); err != nil {
+			return 0, err
+		}
+	}
+	sids := make([]string, 0, len(candidates))
+	for i := range candidates {
+		sids = append(sids, candidates[i].SID)
+	}
+	res := DB.Model(&UserSession{}).Where("sid IN ?", sids).
+		Updates(map[string]interface{}{"status": UserSessionStatusRevoked, "revoked_at": now, "revoked_reason": "idle_evicted"})
+	if res.Error != nil {
+		return 0, res.Error
+	}
+	for i := range candidates {
+		candidates[i].Status = UserSessionStatusRevoked
+		candidates[i].RevokedAt = now
+		candidates[i].RevokedReason = "idle_evicted"
+		if err := writeUserSessionCache(candidates[i].cacheEntry(), time.Time{}); err != nil {
+			common.SysLog("failed to finalize idle-evicted user session revoke tombstone: " + err.Error())
+		}
+	}
+	return res.RowsAffected, nil
+}
+
 // CountUserSessionsCreatedSince counts every issued row, regardless of its
 // current status or expiry. userID zero selects the global count.
 func CountUserSessionsCreatedSince(userID int, createdAfter int64) (int64, error) {

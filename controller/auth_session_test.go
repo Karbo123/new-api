@@ -48,7 +48,7 @@ func TestAuthLogoutRejectsRefreshCookieSessionMismatch(t *testing.T) {
 	c.Request = httptest.NewRequest(http.MethodPost, "/api/user/auth/logout", nil)
 	c.Request.Header.Set("Authorization", "Bearer "+sessionA.AccessToken)
 	c.Request.Header.Set("X-Auth-Session", sessionA.Session.SID)
-	c.Request.AddCookie(&http.Cookie{Name: service.RefreshCookieName, Value: sessionB.RefreshToken})
+	c.Request.AddCookie(&http.Cookie{Name: service.RefreshCookieName(), Value: sessionB.RefreshToken})
 
 	AuthLogout(c)
 
@@ -152,4 +152,59 @@ func TestSessionLimitDoesNotRecordRejectedLoginAsSuccessful(t *testing.T) {
 	var stored model.User
 	require.NoError(t, db.First(&stored, user.Id).Error)
 	assert.Equal(t, previousLastLoginAt, stored.LastLoginAt)
+}
+
+func TestSessionLimitEvictsIdleSessionAndLetsLoginSucceed(t *testing.T) {
+	previousDB := model.DB
+	previousLogDB := model.LOG_DB
+	previousRedis := common.RedisEnabled
+	previousActiveLimit := common.UserSessionActiveLimit
+	previousIssuanceLimit := common.UserSessionIssuanceLimit
+	previousIssuanceWindow := common.UserSessionIssuanceWindowSeconds
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.User{}, &model.UserSession{}, &model.Log{}))
+	model.DB = db
+	model.LOG_DB = db
+	common.RedisEnabled = false
+	common.UserSessionActiveLimit = 1
+	common.UserSessionIssuanceLimit = 100
+	common.UserSessionIssuanceWindowSeconds = int64(common.DefaultUserSessionIssuanceWindowSeconds)
+	t.Cleanup(func() {
+		model.DB = previousDB
+		model.LOG_DB = previousLogDB
+		common.RedisEnabled = previousRedis
+		common.UserSessionActiveLimit = previousActiveLimit
+		common.UserSessionIssuanceLimit = previousIssuanceLimit
+		common.UserSessionIssuanceWindowSeconds = previousIssuanceWindow
+	})
+
+	const previousLastLoginAt = int64(123)
+	user := &model.User{
+		Username: "stale-session-eviction-user", Password: "unused", Role: common.RoleCommonUser,
+		Status: common.UserStatusEnabled, Group: "default", AuthVersion: 1, LastLoginAt: previousLastLoginAt,
+	}
+	require.NoError(t, db.Create(user).Error)
+	now := time.Now().Unix()
+	// Quota is full, but the only active session has been idle for over 24h:
+	// the login must evict it instead of failing with 409.
+	require.NoError(t, db.Create(&model.UserSession{
+		SID: "stale-active-session", UserID: user.Id, Version: 1, UserAuthVersion: user.AuthVersion,
+		Status: model.UserSessionStatusActive, RefreshHash: "hash", LoginMethod: "password",
+		CreatedAt: now - 48*3600, LastActiveAt: now - 25*3600, ExpiresAt: now + 3600,
+	}).Error)
+
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodPost, "/api/user/login", nil)
+	setupLogin(user, c)
+
+	assert.Equal(t, http.StatusOK, recorder.Code)
+	var stored model.User
+	require.NoError(t, db.First(&stored, user.Id).Error)
+	assert.Greater(t, stored.LastLoginAt, previousLastLoginAt, "the healed login must be recorded as successful")
+	staleSession, err := model.GetUserSessionBySID("stale-active-session")
+	require.NoError(t, err)
+	assert.Equal(t, model.UserSessionStatusRevoked, staleSession.Status)
 }

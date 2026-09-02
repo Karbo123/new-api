@@ -98,12 +98,19 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 		if channel.TestModel != nil && *channel.TestModel != "" {
 			testModel = strings.TrimSpace(*channel.TestModel)
 		} else {
-			models := channel.GetModels()
-			if len(models) > 0 {
-				testModel = strings.TrimSpace(models[0])
-			}
-			if testModel == "" {
-				testModel = "gpt-4o-mini"
+			// 自动挑选时跳过生图模型：chat 探针对生图模型上游必回 400，
+			// 定时探活每轮都白打一次错误请求（会被供应商记为无效流量）。
+			// 全列表都是生图模型时保留 models[0]，手动测试仍能拿到真实报错
+			if m := pickAutoTestModel(channel); m != "" {
+				testModel = m
+			} else {
+				models := channel.GetModels()
+				if len(models) > 0 {
+					testModel = strings.TrimSpace(models[0])
+				}
+				if testModel == "" {
+					testModel = "gpt-4o-mini"
+				}
 			}
 		}
 	}
@@ -413,7 +420,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	//	}
 	//}
 
-	if len(info.ParamOverride) > 0 {
+	if relaycommon.ShouldApplyParamOverrideWithRelayInfo(info) {
 		jsonData, err = relaycommon.ApplyParamOverrideWithRelayInfo(jsonData, info)
 		if err != nil {
 			if fixedErr, ok := relaycommon.AsParamOverrideReturnError(err); ok {
@@ -1120,9 +1127,45 @@ func selectChannelsForAutomaticTest(channels []*model.Channel, mode string) []*m
 		if mode == operation_setting.ChannelTestModePassiveRecovery && channel.Status != common.ChannelStatusAutoDisabled {
 			continue
 		}
+		// 模型列表全是生图模型的渠道自动探活跳过：chat 探针必 400，定时任务
+		// 每轮都向上游刷一条无效请求（真实案例：生图专用 key 渠道被 3 分钟一次
+		// 打了六周，遭供应商投诉）。手动单渠道测试不受影响，仍返回真实错误
+		if m := pickAutoTestModel(channel); m == "" && len(channel.GetModels()) > 0 {
+			continue
+		}
 		selected = append(selected, channel)
 	}
 	return selected
+}
+
+// pickAutoTestModel 返回自动探活应使用的模型：优先渠道显式配置的测试模型，
+// 否则取模型列表第一个非生图模型；无可用聊天模型时返回空串。
+func pickAutoTestModel(channel *model.Channel) string {
+	if channel.TestModel != nil {
+		if m := strings.TrimSpace(*channel.TestModel); m != "" {
+			return m
+		}
+	}
+	for _, m := range channel.GetModels() {
+		m = strings.TrimSpace(m)
+		if m != "" && !isImageGenerationModelName(m) {
+			return m
+		}
+	}
+	return ""
+}
+
+func isImageGenerationModelName(name string) bool {
+	n := strings.ToLower(name)
+	for _, kw := range []string{
+		"image", "dall-e", "dalle", "flux", "stable-diffusion", "sd3",
+		"sora_image", "seedream", "midjourney", "mj_", "imagen", "nano-banana",
+	} {
+		if strings.Contains(n, kw) {
+			return true
+		}
+	}
+	return false
 }
 
 // TestAllChannels enqueues a channel_test system task instead of running the

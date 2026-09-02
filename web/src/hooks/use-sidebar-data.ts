@@ -28,6 +28,7 @@ import {
   MessageSquare,
   PlugZap,
   Radio,
+  Scale,
   ServerCog,
   Settings,
   Ticket,
@@ -124,6 +125,11 @@ export function useSidebarData(): SidebarData {
             title: t('Channels'),
             url: '/channels',
             icon: Radio,
+          },
+          {
+            title: t('Price Compare'),
+            url: '/price-compare',
+            icon: Scale,
           },
           {
             title: t('Models'),

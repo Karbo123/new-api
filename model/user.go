@@ -513,6 +513,23 @@ func GetUserIdByAffCode(affCode string) (int, error) {
 	return user.Id, err
 }
 
+// GetEnabledUserIdByRole 取一个 role >= minRole 且处于启用状态的用户 id
+// （role 最高者优先，同 role 取 id 最小），供本机免密登录挑选放行账号。
+// 无匹配用户时返回 0。
+func GetEnabledUserIdByRole(minRole int) (int, error) {
+	var ids []int
+	err := DB.Table("users").
+		Where("role >= ? AND status = ?", minRole, common.UserStatusEnabled).
+		Order("role DESC, id ASC").Limit(1).Pluck("id", &ids).Error
+	if err != nil {
+		return 0, err
+	}
+	if len(ids) == 0 {
+		return 0, nil
+	}
+	return ids[0], nil
+}
+
 func DeleteUserById(id int) (err error) {
 	if id == 0 {
 		return errors.New("id 为空！")
