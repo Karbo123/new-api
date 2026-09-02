@@ -34,6 +34,13 @@
           "annotations": null
         }
       ],
+      "summary": [
+        {
+          "type": "summary_text",
+          "text": "Deep thought.",
+          "annotations": null
+        }
+      ],
       "quality": "",
       "size": ""
     },

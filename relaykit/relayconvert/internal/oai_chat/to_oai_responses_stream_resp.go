@@ -177,6 +177,7 @@ func (s *ChatToResponsesStreamState) appendReasoningDelta(delta string) []ChatTo
 				ID:      s.reasoningID(),
 				Status:  "in_progress",
 				Content: []dto.ResponsesOutputContent{},
+				Summary: []dto.ResponsesOutputContent{},
 			},
 		}))
 	}
@@ -392,16 +393,20 @@ func (s *ChatToResponsesStreamState) messageOutput(status string) *dto.Responses
 }
 
 func (s *ChatToResponsesStreamState) reasoningOutput(status string) *dto.ResponsesOutput {
+	reasoningContent := []dto.ResponsesOutputContent{
+		{
+			Type: "summary_text",
+			Text: s.reasoning.String(),
+		},
+	}
 	return &dto.ResponsesOutput{
 		Type:   responsesOutputTypeReasoning,
 		ID:     s.reasoningID(),
 		Status: status,
-		Content: []dto.ResponsesOutputContent{
-			{
-				Type: "summary_text",
-				Text: s.reasoning.String(),
-			},
-		},
+		// `summary` is the standard Responses field clients parse and echo back;
+		// `content` is kept for clients relying on the previous shape.
+		Content: reasoningContent,
+		Summary: reasoningContent,
 	}
 }
 

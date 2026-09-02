@@ -73,16 +73,20 @@ func ChatCompletionsResponseToResponsesResponse(resp *dto.OpenAITextResponse, id
 		})
 	}
 	if reasoning := choice.Message.GetReasoningContent(); reasoning != "" {
+		reasoningContent := []dto.ResponsesOutputContent{
+			{
+				Type: "summary_text",
+				Text: reasoning,
+			},
+		}
 		out.Output = append(out.Output, dto.ResponsesOutput{
 			Type:   responsesOutputTypeReasoning,
 			ID:     fmt.Sprintf("%s_reasoning_0", id),
 			Status: responseOutputStatus(out),
-			Content: []dto.ResponsesOutputContent{
-				{
-					Type: "summary_text",
-					Text: reasoning,
-				},
-			},
+			// `summary` is the standard Responses field clients parse and echo back;
+			// `content` is kept for clients relying on the previous shape.
+			Content: reasoningContent,
+			Summary: reasoningContent,
 		})
 	}
 

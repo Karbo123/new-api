@@ -4,6 +4,17 @@
 
 # New API
 
+> ## ⚠️ 本地补丁版说明（Karbo123 fork）
+>
+> 本分支基于官方 [QuantumNous/new-api](https://github.com/QuantumNous/new-api) 的 `v1.0.0-rc.30` 标签构建，包含一个针对 DeepSeek V4 thinking 模式多轮对话 400 报错的本地修复（未合并到官方上游）：
+>
+> - **问题现象**：客户端（如 Console Go / opencode 等）通过 `/v1/responses`（OpenAI Responses 协议）访问 OpenAI 兼容通道（如 OpenCode Zen）上的 `deepseek-v4-flash`，第一轮正常，第二轮及之后报 `400 invalid_request_error: The reasoning_text in the thinking mode must be passed back to the API`。
+> - **根因**：new-api 将 Responses 请求转换为 Chat Completions 请求时，丢弃了客户端回传的 `reasoning` 输出项（推理内容），导致 thinking 模式下 assistant 历史消息缺少 `reasoning_content` 字段，上游（DeepSeek V4 / OpenCode Zen）拒绝请求。
+> - **修复内容**（相对官方 rc.30 的改动）：
+>   1. `relaykit/relayconvert/internal/oai_responses/to_oai_chat_req.go` — Responses→Chat 请求转换时，识别客户端回传的 `type:"reasoning"` 输出项，从其 `content` / `summary` / `reasoning_details` 中提取推理文本，作为 `reasoning_content` 附加到紧随其后的 assistant 消息上；同时兼容客户端把推理内联在 assistant 项（`reasoning_content` / `reasoning` 字段）的写法；不再把 reasoning 项错误地转成空 user 消息。
+>   2. `relaykit/dto/openai_response.go` + `relaykit/relayconvert/internal/oai_chat/to_oai_responses_resp.go` / `to_oai_responses_stream_resp.go` — Chat→Responses 响应转换时，reasoning 输出项同时输出标准 `summary` 字段与原有 `content` 字段（内容相同），保证标准 Responses 客户端能解析并回传推理文本，形成完整闭环。
+> - **注意**：官方 PR #6998（Claude 协议路径的 signature 回传）与本修复路径不同、互不包含；本分支**未包含** PR #6998 的改动。若后续使用官方新版 release（合并相应修复后），可直接替换回官方二进制。
+
 🍥 **Next-Generation LLM Gateway and AI Asset Management System**
 
 <p align="center">
