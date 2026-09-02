@@ -49,7 +49,8 @@ import { useTurnstile } from '@/features/auth/hooks/use-turnstile'
 import { beginPasskeyLogin, finishPasskeyLogin } from '@/features/auth/passkey'
 import type { AuthFormProps } from '@/features/auth/types'
 import { useStatus } from '@/hooks/use-status'
-import { isAuthBundle } from '@/lib/api'
+import { api, isAuthBundle } from '@/lib/api'
+import { refreshAuthentication } from '@/lib/auth-session'
 import {
   buildAssertionResult,
   prepareCredentialRequestOptions,
@@ -96,6 +97,76 @@ export function UserAuthForm({
     validateTurnstile,
   } = useTurnstile()
   const { handleLoginSuccess, redirectTo2FA } = useAuthRedirect()
+  const authAccessToken = useAuthStore((state) => state.auth.accessToken)
+
+  // 本机免登录：后端开启 LOCAL_AUTH_BYPASS 且请求来自本机时，静默自动登录。
+  // 先走静默刷新（浏览器已有刷新 cookie 时复用既有会话，不新建），失败才新建会话。
+  // 限流/瞬时错误有界退避重试（5s/15s 共 3 次）——此前无退避且依赖数组含未
+  // memo 的回调，每次渲染重发请求，GA 限流打满后形成热循环自耗预算
+  useEffect(() => {
+    if (status?.local_bypass !== true) return
+    if (authAccessToken) return
+    // 页面地址本身不是本机（局域网 IP/域名）时绝不发起，失败也静默——
+    // 不向外部访客暴露免密机制的存在
+    const host = window.location.hostname
+    if (!(host === 'localhost' || host === '::1' || host.startsWith('127.'))) {
+      return
+    }
+    let cancelled = false
+    const backoffDelays = [0, 5000, 15000]
+    ;(async () => {
+      for (let attempt = 0; attempt < backoffDelays.length; attempt++) {
+        if (backoffDelays[attempt] > 0) {
+          await new Promise((resolve) => setTimeout(resolve, backoffDelays[attempt]))
+          if (cancelled) return
+        }
+        try {
+          // 仅首轮尝试静默刷新：refresh 在 CriticalRateLimit 桶里（默认仅
+          // 20/20min），退避重试轮只走免密端点，避免每次级联烧多次 CT 配额
+          if (attempt === 0) {
+            const outcome = await refreshAuthentication()
+            if (cancelled) return
+            if (outcome.kind === 'authenticated') {
+              await handleLoginSuccess(outcome.bundle, redirectTo)
+              toast.success(t('Welcome back!'))
+              return
+            }
+          }
+          // 非 authenticated（匿名/限流/瞬时错）一律尝试免密端点：本机专用，
+          // 端点自身校验回环+Host，宽松无泄漏风险；失败保持表单
+          const res = await api.get('/api/user/local_auto_login', {
+            skipBusinessError: true,
+            skipErrorHandler: true,
+          })
+          if (cancelled) return
+          if (res.data?.success && isAuthBundle(res.data.data)) {
+            await handleLoginSuccess(res.data.data, redirectTo)
+            toast.success(t('Welcome back!'))
+            return
+          }
+          /* 明确失败：保持登录表单，静默 */
+          return
+        } catch (error) {
+          const status = // axios 429/5xx 走 rejection，退避后重试
+            (
+              error as { response?: { status?: number } } | null
+            )?.response?.status
+          if (status === 429 || (status !== undefined && status >= 500)) continue
+          /* 其他错误：静默保持登录表单 */
+          return
+        }
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [
+    status?.local_bypass,
+    authAccessToken,
+    handleLoginSuccess,
+    redirectTo,
+    t,
+  ])
   const setPending2FAFlowToken = useAuthStore(
     (state) => state.auth.setPending2FAFlowToken
   )

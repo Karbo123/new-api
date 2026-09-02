@@ -413,7 +413,7 @@ func testChannel(ctx context.Context, channel *model.Channel, testUserID int, te
 	//	}
 	//}
 
-	if len(info.ParamOverride) > 0 {
+	if relaycommon.ShouldApplyParamOverrideWithRelayInfo(info) {
 		jsonData, err = relaycommon.ApplyParamOverrideWithRelayInfo(jsonData, info)
 		if err != nil {
 			if fixedErr, ok := relaycommon.AsParamOverrideReturnError(err); ok {

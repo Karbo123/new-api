@@ -91,8 +91,10 @@ func GetStatus(c *gin.Context) {
 		"self_use_mode_enabled":         operation_setting.SelfUseModeEnabled,
 		"register_enabled":              common.RegisterEnabled,
 		"password_login_enabled":        common.PasswordLoginEnabled,
-		"password_register_enabled":     common.PasswordRegisterEnabled,
-		"default_use_auto_group":        setting.DefaultUseAutoGroup,
+		// 只对来自本机的请求 advertise 免密登录标志：外部访客不应感知该机制的存在
+		"local_bypass":              common.LocalAuthBypass && common.IsLoopbackRequest(c.Request),
+		"password_register_enabled": common.PasswordRegisterEnabled,
+		"default_use_auto_group":    setting.DefaultUseAutoGroup,
 
 		"password_login_encryption_enabled": common.PasswordLoginEncryptionEnabled,
 

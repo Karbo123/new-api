@@ -181,6 +181,9 @@ func finishAdminAudit(c *gin.Context, writer *auditResponseWriter) {
 }
 
 func auditAuthMethod(c *gin.Context) string {
+	if c.GetBool("local_bypass") {
+		return "local_bypass"
+	}
 	if c.GetBool("use_access_token") {
 		return "access_token"
 	}

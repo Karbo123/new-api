@@ -134,6 +134,7 @@ export interface SystemStatus {
     oauth_register_enabled?: boolean
     register_enabled?: boolean
     password_login_enabled?: boolean
+    local_bypass?: boolean
     password_login_encryption_enabled?: boolean
     password_register_enabled?: boolean
     custom_oauth_providers?: CustomOAuthProviderInfo[]
