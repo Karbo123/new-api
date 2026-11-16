@@ -2642,7 +2642,9 @@ func pcFetchLlmStats(force bool) {
 	if json.Unmarshal([]byte(body), &list) != nil || len(list) == 0 {
 		return
 	}
-	// 抓全部模型详情（每家详情返回它有分的基准全量榜，并集即完整基准覆盖）
+	// 抓全部模型详情（每家详情返回它有分的基准全量榜，并集即完整基准覆盖）。
+	// 串行 120 页在站方变慢时会拖 6-12 分钟、成为整条刷新流水线的长尾（实测
+	// 两轮刷新均卡在本源 10 分钟+），改 6 路并发把墙钟压回分钟级
 	if len(list) > 120 {
 		list = list[:120]
 	}
@@ -2665,38 +2667,50 @@ func pcFetchLlmStats(force bool) {
 		rows map[string]pcNamed // model_id → 行
 	}
 	acc := map[string]*boardAcc{}
+	var detMu sync.Mutex
+	var wgLs sync.WaitGroup
+	semLs := make(chan struct{}, 6)
 	fetched := 0
 	for _, m := range list {
 		if m.ID == "" {
 			continue
 		}
-		body, err := pcHttpGet(pcLsDetailURL+m.ID, 20*time.Second, nil)
-		if err != nil {
-			continue
-		}
-		var det lsDetail
-		if json.Unmarshal([]byte(body), &det) != nil {
-			continue
-		}
-		fetched++
-		for _, rk := range det.Rankings {
-			if rk.ID == "" || len(rk.Rows) == 0 {
-				continue
+		wgLs.Add(1)
+		go func(id string) {
+			defer wgLs.Done()
+			semLs <- struct{}{}
+			defer func() { <-semLs }()
+			body, err := pcHttpGet(pcLsDetailURL+id, 20*time.Second, nil)
+			if err != nil {
+				return
 			}
-			b, ok := acc[rk.ID]
-			if !ok {
-				b = &boardAcc{name: rk.Name, rows: map[string]pcNamed{}}
-				acc[rk.ID] = b
+			var det lsDetail
+			if json.Unmarshal([]byte(body), &det) != nil {
+				return
 			}
-			for _, r := range rk.Rows {
-				if r.ModelID == "" || r.Score <= 0 {
+			detMu.Lock()
+			defer detMu.Unlock()
+			fetched++
+			for _, rk := range det.Rankings {
+				if rk.ID == "" || len(rk.Rows) == 0 {
 					continue
 				}
-				b.rows[r.ModelID] = pcNamed{Name: r.ModelName, Alias: r.ModelID,
-					Scores: map[string]float64{rk.ID: math.Round(r.Score*1e4) / 100, rk.ID + "_rank": float64(r.Rank)}}
+				b, ok := acc[rk.ID]
+				if !ok {
+					b = &boardAcc{name: rk.Name, rows: map[string]pcNamed{}}
+					acc[rk.ID] = b
+				}
+				for _, r := range rk.Rows {
+					if r.ModelID == "" || r.Score <= 0 {
+						continue
+					}
+					b.rows[r.ModelID] = pcNamed{Name: r.ModelName, Alias: r.ModelID,
+						Scores: map[string]float64{rk.ID: math.Round(r.Score*1e4) / 100, rk.ID + "_rank": float64(r.Rank)}}
+				}
 			}
-		}
+		}(m.ID)
 	}
+	wgLs.Wait()
 	if fetched == 0 {
 		return
 	}
@@ -2815,26 +2829,54 @@ func pcFetchAiq(force bool) {
 	if len(rows) < 30 {
 		return // 覆盖异常（结构改版/截断），保旧缓存
 	}
-	// ③ benchmark 子榜单：原始分 + 排名并入同一行（field / field_rank）
+	// ③ benchmark 子榜单：原始分 + 排名并入同一行（field / field_rank）。
+	// 逐个串行在站方变慢时会拖长整条刷新流水线（与 LLM Stats 同类长尾），改
+	// 6 路并发抓取、各 worker 暂存结果，抓完统一串行归并（rows 追加顺序与
+	// 串行版不同，仅影响无基准分新行的出现顺序，索引与匹配不受影响）
+	type aiqBenchPart struct {
+		id     string
+		name   string
+		models []struct {
+			ID    string   `json:"id"`
+			Rank  int      `json:"rank"`
+			Score *float64 `json:"score"`
+		}
+	}
+	semAiq := make(chan struct{}, 6)
+	var wgAiq sync.WaitGroup
+	var muAiq sync.Mutex
+	parts := []aiqBenchPart{}
 	for _, id := range bench {
-		rb, err := pcHttpGet(pcAiqRankURL+"/"+id, 25*time.Second, nil)
-		if err != nil {
-			continue
-		}
-		var rk struct {
-			RankingName string `json:"rankingName"`
-			Models      []struct {
-				ID    string   `json:"id"`
-				Rank  int      `json:"rank"`
-				Score *float64 `json:"score"`
-			} `json:"models"`
-		}
-		if json.Unmarshal([]byte(rb), &rk) != nil || rk.RankingName == "" {
-			continue
-		}
-		f := field(id)
-		meta[f] = rk.RankingName
-		for _, x := range rk.Models {
+		wgAiq.Add(1)
+		go func(id string) {
+			defer wgAiq.Done()
+			semAiq <- struct{}{}
+			defer func() { <-semAiq }()
+			rb, err := pcHttpGet(pcAiqRankURL+"/"+id, 25*time.Second, nil)
+			if err != nil {
+				return
+			}
+			var rk struct {
+				RankingName string `json:"rankingName"`
+				Models      []struct {
+					ID    string   `json:"id"`
+					Rank  int      `json:"rank"`
+					Score *float64 `json:"score"`
+				} `json:"models"`
+			}
+			if json.Unmarshal([]byte(rb), &rk) != nil || rk.RankingName == "" {
+				return
+			}
+			muAiq.Lock()
+			parts = append(parts, aiqBenchPart{id: id, name: rk.RankingName, models: rk.Models})
+			muAiq.Unlock()
+		}(id)
+	}
+	wgAiq.Wait()
+	for _, p := range parts {
+		f := field(p.id)
+		meta[f] = p.name
+		for _, x := range p.models {
 			if x.Score == nil || x.ID == "" {
 				continue
 			}
