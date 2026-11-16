@@ -89,23 +89,26 @@ export function RefreshDialog({
   } else if (showResult && pc.refreshStatus?.finished) {
     view = 'result'
   }
+  let title = t('Refresh now')
+  let description = t(
+    'Choose the steps to refresh now — unchecked steps are skipped'
+  )
+  if (view === 'progress') {
+    title = t('Refreshing…')
+    description = t(
+      "Refresh keeps running in the background — closing this window won't stop it"
+    )
+  } else if (view === 'result') {
+    title = t('Refresh completed')
+    description = t('Pipeline finished — stage statuses are shown above')
+  }
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className='sm:max-w-xl'>
         <DialogHeader>
-          <DialogTitle>
-            {view === 'select' ? t('Refresh now') : t('Refreshing…')}
-          </DialogTitle>
-          <DialogDescription>
-            {view === 'select'
-              ? t(
-                  'Choose the steps to refresh now — unchecked steps are skipped'
-                )
-              : t(
-                  "Refresh keeps running in the background — closing this window won't stop it"
-                )}
-          </DialogDescription>
+          <DialogTitle>{title}</DialogTitle>
+          <DialogDescription>{description}</DialogDescription>
         </DialogHeader>
 
         {view === 'select' ? (

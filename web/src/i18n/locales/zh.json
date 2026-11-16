@@ -5856,6 +5856,7 @@
     "Refresh keeps running in the background — closing this window won't stop it": "刷新在后台继续进行，关闭此窗口不会中断",
     "Start refresh": "开始刷新",
     "Start a new refresh": "重新发起刷新",
-    "Refresh completed with {{count}} failed step(s)": "刷新完成，{{count}} 个阶段失败"
+    "Refresh completed with {{count}} failed step(s)": "刷新完成，{{count}} 个阶段失败",
+    "Pipeline finished — stage statuses are shown above": "流水线已结束，各阶段状态见上方"
   }
 }
