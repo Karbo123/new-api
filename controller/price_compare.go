@@ -5678,8 +5678,10 @@ func pcRunRefresh(force bool, sel []string) {
 			})
 		}
 		// 阶段一：独立数据源并行抓取（各源写缓存均有 pcMu 保护），OR 目录+
-		// 供应商价依赖面大放在下一阶段串行
+		// 供应商价依赖面大放在下一阶段串行。每源带 8 分钟硬看门狗：个别源挂死
+		// （无超时的底层连接、站方假死）不再拖死整条流水线，超时记日志后放弃等待
 		runStage("sources", func(report func(current string, done, total int)) {
+			const pcSourceWatchdog = 8 * time.Minute
 			tasks := []struct {
 				name string
 				fn   func()
@@ -5704,22 +5706,66 @@ func pcRunRefresh(force bool, sel []string) {
 				// APIB（apib.ai）定价走站内 Next.js RSC 私有通道，对服务器端请求 307
 				// 门禁（须浏览器会话 cookie），暂无稳定公开接口，未接入定价行情
 			}
-			var wg sync.WaitGroup
 			var mu sync.Mutex
 			done := 0
+			inflight := map[string]bool{}
+			// 进行中名单：上报当前在跑的源名（含刚完成的），卡源一眼可见
+			reportState := func(justDone string) {
+				mu.Lock()
+				names := make([]string, 0, len(inflight))
+				for k := range inflight {
+					names = append(names, k)
+				}
+				sort.Strings(names)
+				d := done
+				mu.Unlock()
+				msg := fmt.Sprintf("并行抓取 %d/%d", d, len(tasks))
+				if justDone != "" {
+					msg += fmt.Sprintf("（%s 完成）", justDone)
+				}
+				if len(names) > 0 {
+					msg += " · 进行中: " + strings.Join(names, "、")
+				}
+				report(msg, d, len(tasks))
+			}
+			// 每源一个事件（正常完成 / 看门狗放弃），主循环收满 len(tasks) 个即
+			// 进入下一阶段；超时后迟到的真实完成只会滞留缓冲，不会被重复计数
+			type srcEvent struct {
+				name  string
+				valid bool
+			}
+			events := make(chan srcEvent, len(tasks))
 			for _, t := range tasks {
-				wg.Add(1)
+				mu.Lock()
+				inflight[t.name] = true
+				mu.Unlock()
 				go func(name string, fn func()) {
-					defer wg.Done()
+					finished := make(chan struct{})
+					go func() {
+						select {
+						case <-finished:
+						case <-time.After(pcSourceWatchdog):
+							common.SysError("price_compare refresh source watchdog: " + name + " 超时放弃（" + fmt.Sprint(pcSourceWatchdog) + "）")
+							mu.Lock()
+							delete(inflight, name)
+							mu.Unlock()
+							events <- srcEvent{name, false}
+						}
+					}()
 					fn()
-					mu.Lock()
-					done++
-					d := done
-					mu.Unlock()
-					report(fmt.Sprintf("并行抓取 %d/%d（%s 完成）", d, len(tasks), name), d, len(tasks))
+					close(finished)
+					events <- srcEvent{name, true}
 				}(t.name, t.fn)
 			}
-			wg.Wait()
+			reportState("")
+			for i := 0; i < len(tasks); i++ {
+				ev := <-events
+				mu.Lock()
+				delete(inflight, ev.name)
+				done++
+				mu.Unlock()
+				reportState(ev.name)
+			}
 			pcSaveCache() // 抓取结果落盘（catalog 被跳过时也要保住本轮抓到的数据）
 		})
 		// 阶段二：OR 目录 + 逐模型供应商报价（大头，force 时全量、否则只补缺失/过期）
