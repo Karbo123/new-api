@@ -149,6 +149,13 @@ export interface PcOrPriceDetail {
   fetched_at: number
 }
 
+// 刷新流水线阶段内明细条目（如行情源的每个源）
+export interface PcStageItem {
+  name: string
+  status: 'pending' | 'running' | 'done' | 'skipped' | 'failed'
+  note?: string
+}
+
 // 刷新流水线单阶段状态（key 与后端 pcStages 对应）
 export interface PcRefreshStageState {
   key: string
@@ -158,6 +165,8 @@ export interface PcRefreshStageState {
   total?: number
   current?: string
   error?: string
+  info?: string[]
+  items?: PcStageItem[]
 }
 
 export interface PcRefreshStatus {

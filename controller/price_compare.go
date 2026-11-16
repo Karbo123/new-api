@@ -384,13 +384,22 @@ type pcRefreshState struct {
 
 // pcRefreshStage 流水线单阶段状态。Status: pending|running|done|skipped|failed
 type pcRefreshStage struct {
-	Key     string `json:"key"`
-	Label   string `json:"label"`
-	Status  string `json:"status"`
-	Done    int    `json:"done,omitempty"`
-	Total   int    `json:"total,omitempty"`
-	Current string `json:"current,omitempty"`
-	Error   string `json:"error,omitempty"`
+	Key     string        `json:"key"`
+	Label   string        `json:"label"`
+	Status  string        `json:"status"`
+	Done    int           `json:"done,omitempty"`
+	Total   int           `json:"total,omitempty"`
+	Current string        `json:"current,omitempty"`
+	Error   string        `json:"error,omitempty"`
+	Info    []string      `json:"info,omitempty"`  // 阶段摘要信息行（面板点开详情展示）
+	Items   []pcStageItem `json:"items,omitempty"` // 阶段明细条目（sources 的 17 源逐个状态）
+}
+
+// pcStageItem 阶段内明细条目（如行情源的每个源）。Status 同 pcRefreshStage
+type pcStageItem struct {
+	Name   string `json:"name"`
+	Status string `json:"status"`
+	Note   string `json:"note,omitempty"`
 }
 
 // pcStages 刷新流水线的固定阶段表（顺序即流水线从左到右的顺序；勾选跳过按 key）
@@ -432,6 +441,29 @@ func pcRefreshSet(f func(*pcRefreshState)) {
 	}
 	pcRefresh.Done, pcRefresh.Total, pcRefresh.Current = done, total, cur
 	pcMu.Unlock()
+}
+
+// pcStageReporter 阶段体向上报进度/明细的把手（idx 指向 pcRefresh.Stages 槽位）
+type pcStageReporter struct{ idx int }
+
+func (r *pcStageReporter) progress(current string, done, total int) {
+	pcRefreshSet(func(st *pcRefreshState) {
+		st.Stages[r.idx].Current = current
+		st.Stages[r.idx].Done = done
+		if total > 0 {
+			st.Stages[r.idx].Total = total
+		}
+	})
+}
+
+// items 覆盖阶段明细条目（传前先深拷贝快照，避免与阶段内并发的写入竞态）
+func (r *pcStageReporter) items(items []pcStageItem) {
+	pcRefreshSet(func(st *pcRefreshState) { st.Stages[r.idx].Items = items })
+}
+
+// info 覆盖阶段摘要信息行
+func (r *pcStageReporter) info(lines []string) {
+	pcRefreshSet(func(st *pcRefreshState) { st.Stages[r.idx].Info = lines })
 }
 
 func pcDataDir() string {
@@ -5680,22 +5712,15 @@ func pcRunRefresh(force bool, sel []string) {
 	pcMu.Unlock()
 	go func() {
 		// runStage 执行单个阶段：未勾选直接返回（初始化已标 skipped），内部通过
-		// report 上报子进度（一个阶段内部可能是多路并行的异步操作）
-		runStage := func(key string, fn func(report func(current string, done, total int))) {
+		// reporter 上报子进度/明细条目/摘要信息（一个阶段内部可能是多路并行的
+		// 异步操作）。各方法独立走 pcRefreshSet（pcMu 保护），轮询 tearing 毫秒级
+		runStage := func(key string, fn func(rep *pcStageReporter)) {
 			idx, ok := sk[key]
 			if !ok || !on[key] {
 				return
 			}
 			pcRefreshSet(func(st *pcRefreshState) { st.Stages[idx].Status = "running" })
-			report := func(current string, done, total int) {
-				pcRefreshSet(func(st *pcRefreshState) {
-					st.Stages[idx].Current = current
-					st.Stages[idx].Done = done
-					if total > 0 {
-						st.Stages[idx].Total = total
-					}
-				})
-			}
+			rep := &pcStageReporter{idx: idx}
 			var err error
 			func() {
 				defer func() {
@@ -5704,7 +5729,7 @@ func pcRunRefresh(force bool, sel []string) {
 						common.SysError(fmt.Sprintf("price_compare refresh stage %s panic: %v", key, r))
 					}
 				}()
-				fn(report)
+				fn(rep)
 			}()
 			pcRefreshSet(func(st *pcRefreshState) {
 				if err != nil {
@@ -5728,7 +5753,7 @@ func pcRunRefresh(force bool, sel []string) {
 		wgSc.Add(2)
 		go func() {
 			defer wgSc.Done()
-			runStage("sources", func(report func(current string, done, total int)) {
+			runStage("sources", func(rep *pcStageReporter) {
 				const pcSourceWatchdog = 8 * time.Minute
 				tasks := []struct {
 					name string
@@ -5756,16 +5781,26 @@ func pcRunRefresh(force bool, sel []string) {
 				}
 				var mu sync.Mutex
 				done := 0
-				inflight := map[string]bool{}
-				// 进行中名单：上报当前在跑的源名（含刚完成的），卡源一眼可见
+				// 17 源逐个状态（面板点开①看明细芯片），launch 即 running
+				states := make([]pcStageItem, len(tasks))
+				idxOf := map[string]int{}
+				for i, t := range tasks {
+					states[i] = pcStageItem{Name: t.name, Status: "running"}
+					idxOf[t.name] = i
+				}
+				// 快照上报：进度文案（含进行中名单）+ 逐源状态
 				reportState := func(justDone string) {
 					mu.Lock()
-					names := make([]string, 0, len(inflight))
-					for k := range inflight {
-						names = append(names, k)
+					names := make([]string, 0, len(states))
+					for _, s := range states {
+						if s.Status == "running" {
+							names = append(names, s.Name)
+						}
 					}
 					sort.Strings(names)
 					d := done
+					cp := make([]pcStageItem, len(states))
+					copy(cp, states)
 					mu.Unlock()
 					msg := fmt.Sprintf("并行抓取 %d/%d", d, len(tasks))
 					if justDone != "" {
@@ -5774,7 +5809,8 @@ func pcRunRefresh(force bool, sel []string) {
 					if len(names) > 0 {
 						msg += " · 进行中: " + strings.Join(names, "、")
 					}
-					report(msg, d, len(tasks))
+					rep.progress(msg, d, len(tasks))
+					rep.items(cp)
 				}
 				// 每源一个事件（正常完成 / 看门狗放弃），主循环收满 len(tasks) 个即
 				// 进入下一阶段；超时后迟到的真实完成只会滞留缓冲，不会被重复计数
@@ -5784,9 +5820,6 @@ func pcRunRefresh(force bool, sel []string) {
 				}
 				events := make(chan srcEvent, len(tasks))
 				for _, t := range tasks {
-					mu.Lock()
-					inflight[t.name] = true
-					mu.Unlock()
 					go func(name string, fn func()) {
 						finished := make(chan struct{})
 						go func() {
@@ -5795,7 +5828,7 @@ func pcRunRefresh(force bool, sel []string) {
 							case <-time.After(pcSourceWatchdog):
 								common.SysError("price_compare refresh source watchdog: " + name + " 超时放弃（" + fmt.Sprint(pcSourceWatchdog) + "）")
 								mu.Lock()
-								delete(inflight, name)
+								states[idxOf[name]] = pcStageItem{Name: name, Status: "failed", Note: "看门狗超时放弃（源挂死）"}
 								mu.Unlock()
 								events <- srcEvent{name, false}
 							}
@@ -5809,10 +5842,16 @@ func pcRunRefresh(force bool, sel []string) {
 				for i := 0; i < len(tasks); i++ {
 					ev := <-events
 					mu.Lock()
-					delete(inflight, ev.name)
 					done++
+					if ev.valid {
+						states[idxOf[ev.name]] = pcStageItem{Name: ev.name, Status: "done"}
+					}
 					mu.Unlock()
-					reportState(ev.name)
+					if ev.valid {
+						reportState(ev.name)
+					} else {
+						reportState("") // 超时放弃已在 watchdog 分支标 failed，计数仍前进
+					}
 				}
 				pcSaveCache() // 抓取结果落盘（catalog 被跳过时也要保住本轮抓到的数据）
 			})
@@ -5821,11 +5860,19 @@ func pcRunRefresh(force bool, sel []string) {
 			defer wgSc.Done()
 			// 阶段二：OR 目录 + 逐模型供应商报价（大头，force 时全量、否则只补
 			// 缺失/过期）。与阶段一并行执行
-			runStage("catalog", func(report func(current string, done, total int)) {
+			runStage("catalog", func(rep *pcStageReporter) {
+				mode := "补漏（只抓缺失/过期）"
+				if force {
+					mode = "全量重抓"
+				}
+				rep.info([]string{"模式: " + mode})
 				pcFetchCatalog(force)
 				if force {
 					pcPrefetchOr(true, func(_ string, done, total int) {
-						report("OpenRouter 供应商价", done, total)
+						rep.progress("OpenRouter 供应商价", done, total)
+						if total > 0 && done >= total {
+							rep.info([]string{fmt.Sprintf("模式: 全量重抓 · 供应商价覆盖模型: %d", total)})
+						}
 					})
 				} else {
 					// 只补缺失/过期的
@@ -5841,8 +5888,9 @@ func pcRunRefresh(force bool, sel []string) {
 						}
 					}
 					pcMu.Unlock()
+					rep.info([]string{fmt.Sprintf("模式: 补漏 · 过期/缺失模型: %d", len(staleIds))})
 					for i, id := range staleIds {
-						report(id, i+1, len(staleIds))
+						rep.progress(id, i+1, len(staleIds))
 						pcFetchOrPrice(id, false)
 					}
 				}
@@ -5851,10 +5899,16 @@ func pcRunRefresh(force bool, sel []string) {
 		}()
 		wgSc.Wait()
 		// 阶段三：汇总各渠道报价重建统一行情（内存重建+落盘，无外网请求）
-		runStage("unified", func(report func(current string, done, total int)) {
-			report("重建统一行情", 0, 1)
-			pcGetUnified(true)
-			report("", 1, 1)
+		runStage("unified", func(rep *pcStageReporter) {
+			t0 := time.Now()
+			rep.progress("重建统一行情", 0, 1)
+			rows, _ := pcGetUnified(true)
+			chans := map[string]bool{}
+			for _, r := range rows {
+				chans[r.Channel] = true
+			}
+			rep.info([]string{fmt.Sprintf("行情行: %d · 渠道: %d · 耗时: %.1fs", len(rows), len(chans), time.Since(t0).Seconds())})
+			rep.progress("", 1, 1)
 		})
 		// 阶段四：零价（免费档）报价批量实测：OR 的 :free 档已全线收回但目录仍挂着，
 		// 按实测而非后缀判定（供应商免费档是否可用只有真实调用说了算）。
@@ -5864,7 +5918,7 @@ func pcRunRefresh(force bool, sel []string) {
 		// 与阶段五【有意串行】（不做并行）：两者共享连通性测试缓存——先免费实测
 		// 再 apply，apply 对免费档直接复用 30 分钟缓存结果不再重付；若并行会对
 		// 同一 OR 账号叠 4+8 路测试流量，挤占同 key 生产流量的每分钟配额
-		runStage("free_test", func(report func(current string, done, total int)) {
+		runStage("free_test", func(rep *pcStageReporter) {
 			if pcOrSlugMap.Load() == nil {
 				pcFetchOrProviderSlugs() // 用户跳过阶段一时兜底：实测钉扎需要 slug 表
 			}
@@ -5882,12 +5936,13 @@ func pcRunRefresh(force bool, sel []string) {
 				}
 			}
 			if len(cands) == 0 {
+				rep.info([]string{"无免费档候选（行情中零价报价为空）"})
 				return
 			}
 			// 并发压到 4：免费档集中在同一 OR 账号，突发太猛会触发上游限流，
 			// 也可能挤占同一把 key 上生产流量的每分钟配额
 			results := pcTestOffersParallel(cands, 30*time.Minute, nil, 4, func(done, total int) {
-				report("实测报价", done, total)
+				rep.progress("实测报价", done, total)
 			})
 			dead := map[string]bool{}
 			tested, infra, rl := 0, 0, 0
@@ -5907,9 +5962,15 @@ func pcRunRefresh(force bool, sel []string) {
 				}
 			}
 			// 限流/网络故障占比过高 = 结果不可信（我们自己太快或本地断网），熔断不标记
-			if tested >= 5 && (infra+rl)*4 >= tested {
+			fuseOn := tested >= 5 && (infra+rl)*4 >= tested
+			if fuseOn {
 				dead = map[string]bool{}
 			}
+			rep.info([]string{
+				fmt.Sprintf("免费档候选: %d · 已测: %d", len(cands), tested),
+				fmt.Sprintf("判死: %d · 限流跳过: %d · 基础设施失败: %d", len(dead), rl, infra),
+				"熔断: " + map[bool]string{true: "触发（失败占比过高，本轮不标记）", false: "未触发"}[fuseOn],
+			})
 			pcMu.Lock()
 			// 只重建免费档键：apply 连通性过滤写回的付费 dead（免费档批量实测
 			// 覆盖不到的）原样保留，否则下一次刷新会把它们整体抹掉
@@ -5929,13 +5990,23 @@ func pcRunRefresh(force bool, sel []string) {
 		})
 		// 阶段五：自动更新规则——按规则重建优先级列表并同步渠道/路由/harness
 		// （规则关闭时内部直接跳过）
-		runStage("auto_rule", func(report func(current string, done, total int)) {
+		runStage("auto_rule", func(rep *pcStageReporter) {
 			if pcOrSlugMap.Load() == nil {
 				pcFetchOrProviderSlugs() // 用户跳过阶段一/四时兜底：路由钉扎需要 slug 表
 			}
-			report("重建优先级列表", 0, 0)
-			pcApplyAutoRule(false, func(done, total int) {
-				report("连通性实测", done, total)
+			rep.progress("重建优先级列表", 0, 0)
+			models, offers, missing, channels, routes, harness, dropped := pcApplyAutoRule(false, func(done, total int) {
+				rep.progress("连通性实测", done, total)
+			})
+			hn := "无"
+			if len(harness) > 0 {
+				hn = strings.Join(harness, "、")
+			}
+			rep.info([]string{
+				fmt.Sprintf("入选模型: %d · 报价: %d", models, offers),
+				fmt.Sprintf("连通性剔除: %d · 规则缺失: %d", dropped, len(missing)),
+				fmt.Sprintf("同步渠道: %d · 路由条目: %d", channels, routes),
+				"harness 同步: " + hn,
 			})
 		})
 		pcRefreshSet(func(st *pcRefreshState) {

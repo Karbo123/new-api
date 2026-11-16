@@ -16,13 +16,17 @@ along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 For commercial licensing, please contact support@quantumnous.com
 */
-import { Fragment } from 'react'
+import { Fragment, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Check, Loader2, SkipForward, X } from 'lucide-react'
 
 import { cn } from '@/lib/utils'
 
-import type { PcRefreshStageState, PcRefreshStatus } from '../types'
+import type {
+  PcRefreshStageState,
+  PcRefreshStatus,
+  PcStageItem,
+} from '../types'
 import { PC_REFRESH_STAGES } from '../use-price-compare'
 
 // 阶段节点状态样式：pending 空心序号 → running 主色旋转 → done 主色实心勾 →
@@ -63,7 +67,32 @@ function stageCircleCls(status: PcRefreshStageState['status']): string {
   }
 }
 
-function StageNode({ stage, index }: { stage: PcRefreshStageState; index: number }) {
+function stageStatusLabel(status: PcRefreshStageState['status'], t: (k: string) => string): string {
+  switch (status) {
+    case 'running':
+      return t('In progress')
+    case 'done':
+      return t('Completed')
+    case 'skipped':
+      return t('Skipped')
+    case 'failed':
+      return t('Failed')
+    default:
+      return t('Not started')
+  }
+}
+
+function StageNode({
+  stage,
+  index,
+  selected,
+  onSelect,
+}: {
+  stage: PcRefreshStageState
+  index: number
+  selected: boolean
+  onSelect: (key: string) => void
+}) {
   const { t } = useTranslation()
   const def = PC_REFRESH_STAGES.find((d) => d.key === stage.key)
   const label = def ? t(def.label) : stage.label
@@ -71,8 +100,20 @@ function StageNode({ stage, index }: { stage: PcRefreshStageState; index: number
     (stage.status === 'running' || stage.status === 'done') &&
     (stage.total ?? 0) > 0
   return (
-    // 弹性宽度：随容器收窄（窄弹窗不裁切），宽容器由连接线吃掉剩余空间
-    <div className='flex min-w-0 flex-1 flex-col items-center gap-1'>
+    // 弹性宽度：随容器收窄（窄弹窗不裁切），宽容器由连接线吃掉剩余空间。
+    // 可点击：展开/收起该阶段的详情面板
+    <button
+      type='button'
+      onClick={(e) => {
+        e.stopPropagation()
+        onSelect(stage.key)
+      }}
+      title={stage.error || stage.current || label}
+      className={cn(
+        'flex min-w-0 flex-1 cursor-pointer flex-col items-center gap-1 rounded-lg p-1.5 outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring',
+        selected ? 'bg-primary/5 ring-primary/40 ring-1' : 'hover:bg-muted/60'
+      )}
+    >
       <div
         className={cn(
           'relative flex h-7 w-7 items-center justify-center rounded-full border-2 transition-colors',
@@ -119,7 +160,7 @@ function StageNode({ stage, index }: { stage: PcRefreshStageState; index: number
           {t('Not started')}
         </span>
       )}
-    </div>
+    </button>
   )
 }
 
@@ -127,7 +168,15 @@ function StageNode({ stage, index }: { stage: PcRefreshStageState; index: number
 // 后点亮。一个节点内部可能有多路并行子操作，以 done/total 计数表达。
 // 节点 flex-1 弹性、连接线限宽（min-w-3 max-w-10）——窄容器节点收窄折行，
 // 宽容器连接线伸展，任何宽度都不裁切
-export function RefreshPipeline({ stages }: { stages: PcRefreshStageState[] }) {
+export function RefreshPipeline({
+  stages,
+  selected,
+  onSelect,
+}: {
+  stages: PcRefreshStageState[]
+  selected: string | null
+  onSelect: (key: string | null) => void
+}) {
   return (
     <div className='flex w-full items-start'>
       {stages.map((s, i) => (
@@ -144,15 +193,147 @@ export function RefreshPipeline({ stages }: { stages: PcRefreshStageState[] }) {
               />
             </div>
           )}
-          <StageNode stage={s} index={i} />
+          <StageNode
+            stage={s}
+            index={i}
+            selected={selected === s.key}
+            onSelect={onSelect}
+          />
         </Fragment>
       ))}
     </div>
   )
 }
 
-// 流水线卡片：聚合标题行 + 流水线 + 总进度条 + 当前活动行。页面进度条与刷新
-// 弹窗共用；status.stages 缺失时（旧后端/无数据）退化为简易文本进度
+// 明细条目芯片（sources 的 17 源逐个状态）：状态图标 + 名称，失败带 note 提示
+const ITEM_CHIP_CLS: Record<PcStageItem['status'], string> = {
+  running: 'border-primary/40 bg-primary/5 text-foreground',
+  done: 'border-transparent bg-muted/60 text-muted-foreground',
+  failed: 'border-destructive/40 bg-destructive/5 text-destructive',
+  pending: 'border-transparent bg-muted/30 text-muted-foreground/70',
+  skipped: 'border-transparent bg-muted/30 text-muted-foreground/70',
+}
+
+function itemIcon(status: PcStageItem['status']) {
+  switch (status) {
+    case 'running':
+      return <Loader2 className='text-primary h-3 w-3 shrink-0 animate-spin' />
+    case 'done':
+      return <Check className='h-3 w-3 shrink-0 opacity-70' />
+    case 'failed':
+      return <X className='h-3 w-3 shrink-0' />
+    default:
+      return (
+        <span className='border-muted-foreground/40 h-2 w-2 shrink-0 rounded-full border' />
+      )
+  }
+}
+
+function ItemChip({ item }: { item: PcStageItem }) {
+  return (
+    <span
+      title={item.note || item.name}
+      className={cn(
+        'flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs',
+        ITEM_CHIP_CLS[item.status]
+      )}
+    >
+      {itemIcon(item.status)}
+      <span className='truncate'>{item.name}</span>
+    </span>
+  )
+}
+
+// 阶段详情面板：状态徽标 + 阶段进度条 + 错误行 + 摘要信息行 + 明细芯片网格
+function StageDetail({ stage }: { stage: PcRefreshStageState }) {
+  const { t } = useTranslation()
+  const def = PC_REFRESH_STAGES.find((d) => d.key === stage.key)
+  const label = def ? t(def.label) : stage.label
+  let pct = 0
+  if ((stage.total ?? 0) > 0) {
+    pct = Math.min(100, ((stage.done ?? 0) / (stage.total ?? 1)) * 100)
+  } else if (stage.status === 'done') {
+    pct = 100
+  }
+  return (
+    <div
+      className={cn(
+        'animate-in fade-in slide-in-from-top-1 mt-3 rounded-md border p-3 duration-200',
+        stage.status === 'failed'
+          ? 'border-destructive/40 bg-destructive/5'
+          : 'bg-background/60'
+      )}
+    >
+      <div className='mb-2 flex flex-wrap items-center gap-2'>
+        <span className='text-foreground text-sm font-medium'>{label}</span>
+        <span
+          className={cn(
+            'rounded-full px-2 py-0.5 text-[11px]',
+            stage.status === 'running' && 'bg-primary/10 text-primary',
+            stage.status === 'done' && 'bg-primary/10 text-primary',
+            stage.status === 'skipped' && 'bg-muted text-muted-foreground',
+            stage.status === 'failed' && 'bg-destructive/10 text-destructive',
+            stage.status === 'pending' && 'bg-muted text-muted-foreground'
+          )}
+        >
+          {stageStatusLabel(stage.status, t)}
+        </span>
+        {(stage.total ?? 0) > 0 && (
+          <span className='text-muted-foreground text-xs tabular-nums'>
+            {stage.done}/{stage.total}
+          </span>
+        )}
+      </div>
+      {/* 阶段内进度条 */}
+      <div className='bg-muted h-1 overflow-hidden rounded-full'>
+        <div
+          className={cn(
+            'h-full rounded-full transition-all duration-500',
+            stage.status === 'failed' ? 'bg-destructive' : 'bg-primary'
+          )}
+          style={{ width: `${pct}%` }}
+        />
+      </div>
+      {stage.error && (
+        <div className='text-destructive mt-2 text-xs break-all'>
+          {t('Failed')}: {stage.error}
+        </div>
+      )}
+      {/* 摘要信息行（后端生成，中文直出与面板其余文案一致） */}
+      {(stage.info?.length ?? 0) > 0 && (
+        <ul className='text-muted-foreground mt-2 space-y-1 text-xs'>
+          {stage.info?.map((line) => (
+            <li key={line} className='flex items-start gap-1.5'>
+              <span className='bg-primary/60 mt-1.5 h-1 w-1 shrink-0 rounded-full' />
+              <span className='break-all'>{line}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+      {/* 明细条目（sources 17 源逐个状态芯片） */}
+      {(stage.items?.length ?? 0) > 0 && (
+        <div className='mt-2 grid grid-cols-2 gap-1.5 sm:grid-cols-3'>
+          {stage.items?.map((it) => (
+            <ItemChip key={it.name} item={it} />
+          ))}
+        </div>
+      )}
+      {stage.status === 'skipped' && (
+        <div className='text-muted-foreground/70 mt-2 text-xs'>
+          {t('Skipped — not selected for this refresh')}
+        </div>
+      )}
+      {stage.status === 'pending' && (
+        <div className='text-muted-foreground/70 mt-2 text-xs'>
+          {t('Waiting for the previous stages to finish')}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// 流水线卡片：聚合标题行 + 可点击流水线（点开展开阶段详情）+ 总进度条 +
+// 当前活动行。页面进度条与刷新弹窗共用；status.stages 缺失时退化为简易文本进度
 export function RefreshPipelineCard({
   status,
   className,
@@ -161,7 +342,9 @@ export function RefreshPipelineCard({
   className?: string
 }) {
   const { t } = useTranslation()
+  const [openKey, setOpenKey] = useState<string | null>(null)
   const stages = status.stages ?? []
+  const openStage = stages.find((s) => s.key === openKey)
   const pct =
     status.total > 0 ? Math.min(100, (status.done / status.total) * 100) : 0
   const failed = stages.filter((s) => s.status === 'failed').length
@@ -202,11 +385,23 @@ export function RefreshPipelineCard({
             {Math.round(status.done)}/{Math.round(status.total)}
           </span>
         )}
+        {stages.length > 0 && (
+          <span className='text-muted-foreground/60 ml-auto hidden text-[11px] sm:inline'>
+            {t('Click a stage for details')}
+          </span>
+        )}
       </div>
       {stages.length > 0 ? (
-        <div className='mt-3'>
-          <RefreshPipeline stages={stages} />
-        </div>
+        <>
+          <div className='mt-3'>
+            <RefreshPipeline
+              stages={stages}
+              selected={openKey}
+              onSelect={(k) => setOpenKey((prev) => (prev === k ? null : k))}
+            />
+          </div>
+          {openStage && <StageDetail stage={openStage} />}
+        </>
       ) : (
         status.current && (
           <div className='mt-2 truncate'>· {status.current}</div>

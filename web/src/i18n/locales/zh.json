@@ -5857,6 +5857,10 @@
     "Start refresh": "开始刷新",
     "Start a new refresh": "重新发起刷新",
     "Refresh completed with {{count}} failed step(s)": "刷新完成，{{count}} 个阶段失败",
-    "Pipeline finished — stage statuses are shown above": "流水线已结束，各阶段状态见上方"
+    "Pipeline finished — stage statuses are shown above": "流水线已结束，各阶段状态见上方",
+    "In progress": "进行中",
+    "Click a stage for details": "点击阶段可查看详情",
+    "Skipped — not selected for this refresh": "已跳过——本次刷新未勾选该阶段",
+    "Waiting for the previous stages to finish": "等待前序阶段完成"
   }
 }
