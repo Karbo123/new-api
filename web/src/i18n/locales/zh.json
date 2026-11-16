@@ -5839,6 +5839,23 @@
     "No models match the filter": "没有匹配的模型",
     "Per 1M tokens at this key group rate ×{{rate}} (lowest group ×{{market}}): input ¥{{in}}, output ¥{{out}}": "按这把 key 的组倍率 ×{{rate}} 实付（市场最低组 ×{{market}}）：输入 ¥{{in}}、输出 ¥{{out}} / 每百万 tokens",
     "Per 1M tokens: input ¥{{in}}, output ¥{{out}}": "每百万 tokens：输入 ¥{{in}}、输出 ¥{{out}}",
-    "Show tested-unreachable offers": "显示实测不可调"
+    "Show tested-unreachable offers": "显示实测不可调",
+    "Fetch market sources": "行情源抓取",
+    "FX · balances · channel model prices · leaderboards (17 in parallel)": "汇率 · 余额 · 各渠道模型价 · 各评测榜单（17 项并行）",
+    "OpenRouter catalog & provider prices": "OR 目录与供应商价",
+    "Slowest step: per-model provider offer fetch": "最耗时：逐模型抓取供应商报价",
+    "Rebuild unified market": "重建统一行情",
+    "Merge channel quotes, persist cache": "汇总各渠道报价并落盘缓存",
+    "Live-test free-tier offers": "免费档报价实测",
+    "Real calls to free offers (4-way parallel)": "零价档真实调用验证（4 路并行）",
+    "Apply auto-update rule": "应用自动更新规则",
+    "Rebuild priority list → channels / routes / harness sync": "重建优先级列表 → 渠道 / 路由 / harness 同步",
+    "Skipped": "已跳过",
+    "Not started": "未执行",
+    "Choose the steps to refresh now — unchecked steps are skipped": "勾选本次要刷新的步骤，未勾选的将跳过",
+    "Refresh keeps running in the background — closing this window won't stop it": "刷新在后台继续进行，关闭此窗口不会中断",
+    "Start refresh": "开始刷新",
+    "Start a new refresh": "重新发起刷新",
+    "Refresh completed with {{count}} failed step(s)": "刷新完成，{{count}} 个阶段失败"
   }
 }

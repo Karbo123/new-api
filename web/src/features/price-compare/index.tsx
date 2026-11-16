@@ -37,6 +37,8 @@ import { KeysCard } from './components/keys-card'
 import { ModelDialog } from './components/model-dialog'
 import { ParetoChart } from './components/pareto-chart'
 import { PriorityPanel } from './components/priority-panel'
+import { RefreshDialog } from './components/refresh-dialog'
+import { RefreshPipelineCard } from './components/refresh-pipeline'
 import {
   ExchangeCard,
   RatioCard,
@@ -51,6 +53,7 @@ export function PriceCompare() {
   const { t } = useTranslation()
   const pc = usePriceCompare()
   const [dialogKey, setDialogKey] = useState<string | null>(null)
+  const [refreshOpen, setRefreshOpen] = useState(false)
 
   return (
     <SectionPageLayout>
@@ -80,13 +83,10 @@ export function PriceCompare() {
               ))}
             </SelectContent>
           </Select>
-          <Button
-            size='sm'
-            onClick={() => void pc.triggerRefresh()}
-            disabled={pc.refreshing}
-          >
+          {/* 刷新中不再禁用：点击可回到流水线进度视图（后台刷新不受影响） */}
+          <Button size='sm' onClick={() => setRefreshOpen(true)}>
             <RefreshCw
-              className={'mr-1 h-3.5 w-3.5' + (pc.refreshing ? ' animate-spin' : '')}
+              className={`mr-1 h-3.5 w-3.5${pc.refreshing ? ' animate-spin' : ''}`}
             />
             {pc.refreshing ? t('Refreshing…') : t('Refresh now')}
           </Button>
@@ -94,29 +94,18 @@ export function PriceCompare() {
       </SectionPageLayout.Actions>
       <SectionPageLayout.Content>
         <div className='space-y-4'>
-          {/* 抓取进度条：放按钮下方独立一行，不挤占顶栏控件 */}
+          {/* 抓取流水线进度：放按钮下方独立一行，点击可打开进度弹窗查看大图 */}
           {pc.refreshing && pc.refreshStatus && (
-            <div className='bg-muted/50 text-muted-foreground rounded-md p-3 text-xs'>
-              <div className='flex items-center gap-2'>
-                <RefreshCw className='h-3.5 w-3.5 animate-spin' />
-                <span className='text-foreground font-medium'>
-                  {t('Refreshing…')}
-                </span>
-                <span className='tabular-nums'>
-                  {Math.round(pc.refreshStatus.done)}/{Math.round(pc.refreshStatus.total)}
-                </span>
-                {pc.refreshStatus.current && (
-                  <span className='truncate'>· {pc.refreshStatus.current}</span>
-                )}
-              </div>
-              <div className='bg-background mt-2 h-1 overflow-hidden rounded-full'>
-                <div
-                  className='bg-primary h-full rounded-full transition-all'
-                  style={{
-                    width: `${pc.refreshStatus.total > 0 ? Math.min(100, (pc.refreshStatus.done / pc.refreshStatus.total) * 100) : 0}%`,
-                  }}
-                />
-              </div>
+            <div
+              className='cursor-pointer'
+              onClick={() => setRefreshOpen(true)}
+              role='button'
+              tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') setRefreshOpen(true)
+              }}
+            >
+              <RefreshPipelineCard status={pc.refreshStatus} />
             </div>
           )}
           <div className='grid grid-cols-1 gap-4 lg:grid-cols-3'>
@@ -132,6 +121,7 @@ export function PriceCompare() {
           <PriorityPanel pc={pc} />
           <AliasCard />
           <ModelDialog pc={pc} openKey={dialogKey} onClose={() => setDialogKey(null)} />
+          <RefreshDialog pc={pc} open={refreshOpen} onOpenChange={setRefreshOpen} />
         </div>
       </SectionPageLayout.Content>
     </SectionPageLayout>

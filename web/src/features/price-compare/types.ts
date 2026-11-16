@@ -149,12 +149,24 @@ export interface PcOrPriceDetail {
   fetched_at: number
 }
 
+// 刷新流水线单阶段状态（key 与后端 pcStages 对应）
+export interface PcRefreshStageState {
+  key: string
+  label: string
+  status: 'pending' | 'running' | 'done' | 'skipped' | 'failed'
+  done?: number
+  total?: number
+  current?: string
+  error?: string
+}
+
 export interface PcRefreshStatus {
   running: boolean
   done: number
   total: number
   current: string
   finished: boolean
+  stages?: PcRefreshStageState[]
 }
 
 export interface PcUnifiedResponse {

@@ -370,18 +370,67 @@ var (
 	pcAutoOnce    sync.Once
 )
 
-// pcRefreshState 后台刷新进度（JSON 字段与前端 PcRefreshStatus 对应）
+// pcRefreshState 后台刷新进度（JSON 字段与前端 PcRefreshStatus 对应）。
+// Done/Total/Current 是跨阶段聚合值（兼容旧版简易进度条）；Stages 是流水线
+// 各阶段的状态（前端勾选弹窗与流水线进度条渲染用）
 type pcRefreshState struct {
-	Running  bool   `json:"running"`
-	Done     int    `json:"done"`
-	Total    int    `json:"total"`
-	Current  string `json:"current"`
-	Finished bool   `json:"finished"`
+	Running  bool             `json:"running"`
+	Done     int              `json:"done"`
+	Total    int              `json:"total"`
+	Current  string           `json:"current"`
+	Finished bool             `json:"finished"`
+	Stages   []pcRefreshStage `json:"stages,omitempty"`
+}
+
+// pcRefreshStage 流水线单阶段状态。Status: pending|running|done|skipped|failed
+type pcRefreshStage struct {
+	Key     string `json:"key"`
+	Label   string `json:"label"`
+	Status  string `json:"status"`
+	Done    int    `json:"done,omitempty"`
+	Total   int    `json:"total,omitempty"`
+	Current string `json:"current,omitempty"`
+	Error   string `json:"error,omitempty"`
+}
+
+// pcStages 刷新流水线的固定阶段表（顺序即流水线从左到右的顺序；勾选跳过按 key）
+var pcStages = []struct{ Key, Label string }{
+	{"sources", "行情源抓取"},
+	{"catalog", "OR 目录与供应商价"},
+	{"unified", "重建统一行情"},
+	{"free_test", "免费档报价实测"},
+	{"auto_rule", "应用自动更新规则"},
 }
 
 func pcRefreshSet(f func(*pcRefreshState)) {
 	pcMu.Lock()
 	f(&pcRefresh)
+	// 聚合 Done/Total（skipped 记满、无计数阶段记 1）并推导 Current（首个
+	// running 阶段的标签 + 子进度），供旧版简易进度条兼容显示
+	done, total := 0, 0
+	cur := ""
+	for _, s := range pcRefresh.Stages {
+		if s.Total > 0 {
+			total += s.Total
+			d := s.Done
+			if d > s.Total {
+				d = s.Total
+			}
+			done += d
+		} else {
+			total++
+			if s.Status == "done" || s.Status == "failed" || s.Status == "skipped" {
+				done++
+			}
+		}
+		if s.Status == "running" && cur == "" {
+			cur = s.Label
+			if s.Current != "" {
+				cur += " · " + s.Current
+			}
+		}
+	}
+	pcRefresh.Done, pcRefresh.Total, pcRefresh.Current = done, total, cur
 	pcMu.Unlock()
 }
 
@@ -5149,7 +5198,7 @@ func pcBuildRouteTable(entries map[string]pcPriorityEntry) (map[string][]int, ma
 // 时同步重建比价顺序路由表；规则关闭或当前无行情数据时不做任何改动并清掉旧路由表。
 // manual=true（手动「立即应用」）时连通性实测绕过结果缓存：充值/换 key 后立即
 // 恢复，不必等失败缓存过期；自动刷新走 6h 缓存，同一轮不重复花钱。
-func pcApplyAutoRule(manual bool) (int, int, []string, int, int, []string, int) {
+func pcApplyAutoRule(manual bool, onTest func(done, total int)) (int, int, []string, int, int, []string, int) {
 	cfg := pcLoadPriority()
 	terms := pcRuleTermsFromLegacy(cfg.AutoRule)
 	if len(terms) == 0 {
@@ -5403,7 +5452,7 @@ func pcApplyAutoRule(manual bool) (int, int, []string, int, int, []string, int) 
 	if manual {
 		ttl = 0 // 手动立即应用：绕过结果缓存全量重测（结果仍回写缓存）
 	}
-	results := pcTestOffersParallel(cands, ttl, map[string]bool{"apikl": true, "ikun": true}, 8)
+	results := pcTestOffersParallel(cands, ttl, map[string]bool{"apikl": true, "ikun": true}, 8, onTest)
 	tested, infraFailed := 0, 0
 	for _, c := range cands {
 		r := results[c.key()]
@@ -5557,114 +5606,183 @@ func pcApplyAutoRule(manual bool) (int, int, []string, int, int, []string, int) 
 
 // ---------------- 刷新编排 ----------------
 
-func pcRunRefresh(force bool) {
+// pcRunRefresh 按 pcStages 顺序执行刷新流水线。sel 为勾选的阶段 key 列表
+// （nil/空 = 全部阶段，自动定时刷新即走此路径）；未勾选的阶段标 skipped 直接跳过。
+// 每阶段独立 recover，单阶段异常不影响后续阶段与收尾
+func pcRunRefresh(force bool, sel []string) {
 	pcMu.Lock()
 	if pcRefresh.Running {
 		pcMu.Unlock()
 		return
 	}
-	pcRefresh = pcRefreshState{Running: true, Total: 17, Current: "并行抓取 0/17"}
+	on := map[string]bool{}
+	for _, k := range sel {
+		on[k] = true
+	}
+	if len(on) == 0 {
+		for _, s := range pcStages {
+			on[s.Key] = true
+		}
+	}
+	sk := map[string]int{}
+	sts := make([]pcRefreshStage, 0, len(pcStages))
+	for i, s := range pcStages {
+		sk[s.Key] = i
+		st := pcRefreshStage{Key: s.Key, Label: s.Label, Status: "pending"}
+		if !on[s.Key] {
+			st.Status = "skipped"
+		}
+		sts = append(sts, st)
+	}
+	pcRefresh = pcRefreshState{Running: true, Total: len(pcStages), Current: "准备刷新", Stages: sts}
 	pcMu.Unlock()
 	go func() {
-		// 独立数据源并行抓取（各源写缓存均有 pcMu 保护），OR 目录+供应商价依赖面大殿后串行
-		tasks := []struct {
-			name string
-			fn   func()
-		}{
-			{"汇率", func() { pcFetchExchange(true) }},
-			{"余额", func() { pcFetchBalances() }}, // 余额也按「自动从网络抓取」间隔预查，面板打开即缓存命中
-			{"OpenCode Go", func() { pcFetchGoModels(true) }},
-			{"DeepSeek 别名", func() { pcFetchDsFlashAlias(true) }},
-			{"DeepSeek 官方", func() { pcFetchDeepseek(true) }},
-			{"LiveBench", func() { pcFetchLivebench(true) }},
-			{"Agent Arena", func() { pcFetchArena(true) }},
-			{"OR 用量榜", func() { pcFetchOrRankings(true) }},
-			{"AA 指数", func() { pcFetchAA(true) }},
-			{"Design Arena", func() { pcFetchDesignArena(true) }},
-			{"司南", func() { pcFetchOpenCompass(true) }},
-			{"LLM Stats", func() { pcFetchLlmStats(true) }},
-			{"AI IQ", func() { pcFetchAiq(true) }},
-			{"BuzzAI", func() { pcFetchBuzzaiModels(true) }},
-			{"APIKL", func() { pcFetchApiklModels(true) }},
-			{"IKUN", func() { pcFetchIkunModels(true) }},
-			{"OR 供应商表", func() { pcFetchOrProviderSlugs() }},
-			// APIB（apib.ai）定价走站内 Next.js RSC 私有通道，对服务器端请求 307
-			// 门禁（须浏览器会话 cookie），暂无稳定公开接口，未接入定价行情
-		}
-		var wg sync.WaitGroup
-		var mu sync.Mutex
-		done := 0
-		for _, t := range tasks {
-			wg.Add(1)
-			go func(name string, fn func()) {
-				defer wg.Done()
-				fn()
-				mu.Lock()
-				done++
-				d := done
-				mu.Unlock()
+		// runStage 执行单个阶段：未勾选直接返回（初始化已标 skipped），内部通过
+		// report 上报子进度（一个阶段内部可能是多路并行的异步操作）
+		runStage := func(key string, fn func(report func(current string, done, total int))) {
+			idx, ok := sk[key]
+			if !ok || !on[key] {
+				return
+			}
+			pcRefreshSet(func(st *pcRefreshState) { st.Stages[idx].Status = "running" })
+			report := func(current string, done, total int) {
 				pcRefreshSet(func(st *pcRefreshState) {
-					st.Done = d
-					st.Current = fmt.Sprintf("并行抓取 %d/%d（%s 完成）", d, len(tasks), name)
+					st.Stages[idx].Current = current
+					st.Stages[idx].Done = done
+					if total > 0 {
+						st.Stages[idx].Total = total
+					}
 				})
-			}(t.name, t.fn)
-		}
-		wg.Wait()
-		pcRefreshSet(func(st *pcRefreshState) { st.Done = len(tasks); st.Current = "OpenRouter 供应商价" })
-		pcFetchCatalog(force)
-		if force {
-			pcPrefetchOr(true, func(_ string, done, total int) {
-				pcRefreshSet(func(st *pcRefreshState) {
-					st.Total = len(tasks) + total
-					st.Done = len(tasks) + done
-				})
+			}
+			var err error
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						err = fmt.Errorf("panic: %v", r)
+						common.SysError(fmt.Sprintf("price_compare refresh stage %s panic: %v", key, r))
+					}
+				}()
+				fn(report)
+			}()
+			pcRefreshSet(func(st *pcRefreshState) {
+				if err != nil {
+					st.Stages[idx].Status = "failed"
+					st.Stages[idx].Error = err.Error()
+				} else {
+					st.Stages[idx].Status = "done"
+					st.Stages[idx].Current = ""
+					if st.Stages[idx].Total > 0 {
+						st.Stages[idx].Done = st.Stages[idx].Total
+					}
+				}
 			})
-		} else {
-			// 只补缺失/过期的
-			pcMu.Lock()
-			staleIds := []string{}
-			for _, m := range pcCache.Models {
-				if strings.HasPrefix(m.Id, "~") || strings.HasPrefix(m.Id, "openrouter/") {
-					continue
-				}
-				p, ok := pcCache.Prices[m.Id]
-				if !ok || len(p.Providers) == 0 || time.Now().Unix()-p.FetchedAt > pcPricesTTL {
-					staleIds = append(staleIds, m.Id)
-				}
-			}
-			pcMu.Unlock()
-			pcRefreshSet(func(st *pcRefreshState) { st.Total = len(tasks) + len(staleIds) })
-			for _, id := range staleIds {
-				pcRefreshSet(func(st *pcRefreshState) { st.Current = id })
-				pcFetchOrPrice(id, false)
-				pcRefreshSet(func(st *pcRefreshState) { st.Done++ })
-			}
 		}
-		pcSaveCache()
-		pcGetUnified(true)
-		// 零价（免费档）报价批量实测：OR 的 :free 档已全线收回但目录仍挂着，
+		// 阶段一：独立数据源并行抓取（各源写缓存均有 pcMu 保护），OR 目录+
+		// 供应商价依赖面大放在下一阶段串行
+		runStage("sources", func(report func(current string, done, total int)) {
+			tasks := []struct {
+				name string
+				fn   func()
+			}{
+				{"汇率", func() { pcFetchExchange(true) }},
+				{"余额", func() { pcFetchBalances() }}, // 余额也按「自动从网络抓取」间隔预查，面板打开即缓存命中
+				{"OpenCode Go", func() { pcFetchGoModels(true) }},
+				{"DeepSeek 别名", func() { pcFetchDsFlashAlias(true) }},
+				{"DeepSeek 官方", func() { pcFetchDeepseek(true) }},
+				{"LiveBench", func() { pcFetchLivebench(true) }},
+				{"Agent Arena", func() { pcFetchArena(true) }},
+				{"OR 用量榜", func() { pcFetchOrRankings(true) }},
+				{"AA 指数", func() { pcFetchAA(true) }},
+				{"Design Arena", func() { pcFetchDesignArena(true) }},
+				{"司南", func() { pcFetchOpenCompass(true) }},
+				{"LLM Stats", func() { pcFetchLlmStats(true) }},
+				{"AI IQ", func() { pcFetchAiq(true) }},
+				{"BuzzAI", func() { pcFetchBuzzaiModels(true) }},
+				{"APIKL", func() { pcFetchApiklModels(true) }},
+				{"IKUN", func() { pcFetchIkunModels(true) }},
+				{"OR 供应商表", func() { pcFetchOrProviderSlugs() }},
+				// APIB（apib.ai）定价走站内 Next.js RSC 私有通道，对服务器端请求 307
+				// 门禁（须浏览器会话 cookie），暂无稳定公开接口，未接入定价行情
+			}
+			var wg sync.WaitGroup
+			var mu sync.Mutex
+			done := 0
+			for _, t := range tasks {
+				wg.Add(1)
+				go func(name string, fn func()) {
+					defer wg.Done()
+					fn()
+					mu.Lock()
+					done++
+					d := done
+					mu.Unlock()
+					report(fmt.Sprintf("并行抓取 %d/%d（%s 完成）", d, len(tasks), name), d, len(tasks))
+				}(t.name, t.fn)
+			}
+			wg.Wait()
+			pcSaveCache() // 抓取结果落盘（catalog 被跳过时也要保住本轮抓到的数据）
+		})
+		// 阶段二：OR 目录 + 逐模型供应商报价（大头，force 时全量、否则只补缺失/过期）
+		runStage("catalog", func(report func(current string, done, total int)) {
+			pcFetchCatalog(force)
+			if force {
+				pcPrefetchOr(true, func(_ string, done, total int) {
+					report("OpenRouter 供应商价", done, total)
+				})
+			} else {
+				// 只补缺失/过期的
+				pcMu.Lock()
+				staleIds := []string{}
+				for _, m := range pcCache.Models {
+					if strings.HasPrefix(m.Id, "~") || strings.HasPrefix(m.Id, "openrouter/") {
+						continue
+					}
+					p, ok := pcCache.Prices[m.Id]
+					if !ok || len(p.Providers) == 0 || time.Now().Unix()-p.FetchedAt > pcPricesTTL {
+						staleIds = append(staleIds, m.Id)
+					}
+				}
+				pcMu.Unlock()
+				for i, id := range staleIds {
+					report(id, i+1, len(staleIds))
+					pcFetchOrPrice(id, false)
+				}
+			}
+			pcSaveCache()
+		})
+		// 阶段三：汇总各渠道报价重建统一行情（内存重建+落盘，无外网请求）
+		runStage("unified", func(report func(current string, done, total int)) {
+			report("重建统一行情", 0, 1)
+			pcGetUnified(true)
+			report("", 1, 1)
+		})
+		// 阶段四：零价（免费档）报价批量实测：OR 的 :free 档已全线收回但目录仍挂着，
 		// 按实测而非后缀判定（供应商免费档是否可用只有真实调用说了算）。
 		// max_tokens=1 打免费/报错请求成本≈0；结果进连通性测试缓存（30 分钟，
 		// 与 apply 的过滤共用存储）。基础设施性失败（本地断网等）≥25% 且 ≥5 例
 		// 时熔断不标记，防止把全场报价误杀
-		pcRefreshSet(func(st *pcRefreshState) { st.Current = "免费档报价实测" })
-		rows, _ := pcGetUnified(false)
-		cands := []pcTestCand{}
-		seen := map[string]bool{}
-		for _, r := range rows {
-			if r.In > 0 {
-				continue
+		runStage("free_test", func(report func(current string, done, total int)) {
+			rows, _ := pcGetUnified(false)
+			cands := []pcTestCand{}
+			seen := map[string]bool{}
+			for _, r := range rows {
+				if r.In > 0 {
+					continue
+				}
+				c := pcTestCand{strings.ToLower(r.Channel), r.Ref, r.Provider, r.Quant}
+				if !seen[c.key()] {
+					seen[c.key()] = true
+					cands = append(cands, c)
+				}
 			}
-			c := pcTestCand{strings.ToLower(r.Channel), r.Ref, r.Provider, r.Quant}
-			if !seen[c.key()] {
-				seen[c.key()] = true
-				cands = append(cands, c)
+			if len(cands) == 0 {
+				return
 			}
-		}
-		if len(cands) > 0 {
 			// 并发压到 4：免费档集中在同一 OR 账号，突发太猛会触发上游限流，
 			// 也可能挤占同一把 key 上生产流量的每分钟配额
-			results := pcTestOffersParallel(cands, 30*time.Minute, nil, 4)
+			results := pcTestOffersParallel(cands, 30*time.Minute, nil, 4, func(done, total int) {
+				report("实测报价", done, total)
+			})
 			dead := map[string]bool{}
 			tested, infra, rl := 0, 0, 0
 			for _, c := range cands {
@@ -5702,9 +5820,15 @@ func pcRunRefresh(force bool) {
 			pcMu.Unlock()
 			pcSaveCache()
 			pcGetUnified(true) // 带 dead 标记重建行情
-		}
-		// 自动更新规则：抓取完成后按规则重建优先级列表（规则关闭时内部直接跳过）
-		pcApplyAutoRule(false)
+		})
+		// 阶段五：自动更新规则——按规则重建优先级列表并同步渠道/路由/harness
+		// （规则关闭时内部直接跳过）
+		runStage("auto_rule", func(report func(current string, done, total int)) {
+			report("重建优先级列表", 0, 0)
+			pcApplyAutoRule(false, func(done, total int) {
+				report("连通性实测", done, total)
+			})
+		})
 		pcRefreshSet(func(st *pcRefreshState) {
 			st.Running = false
 			st.Finished = true
@@ -5743,7 +5867,7 @@ func pcStartAutoRefresh() {
 					continue
 				}
 				if last == 0 || time.Now().Unix()-last >= int64(interval) {
-					pcRunRefresh(false)
+					pcRunRefresh(false, nil)
 				}
 			}
 		}()
@@ -5805,7 +5929,7 @@ func pcLoadCacheOnce() {
 		}
 		go func() {
 			// 后台完整刷新：抓源+补 OR 价+应用规则，完成后行情自动更新
-			pcRunRefresh(false)
+			pcRunRefresh(false, nil)
 		}()
 	})
 }
@@ -5883,9 +6007,18 @@ func PostPriceComparePriority(c *gin.Context) {
 	c.JSON(200, gin.H{"success": true, "data": cfg})
 }
 
+// PostPriceCompareRefresh 手动触发后台刷新。body.stages 为勾选的阶段 key 列表
+// （缺省/空 = 全部阶段；阶段表见 pcStages）。已在跑时直接返回 running，
+// 不会重复触发
 func PostPriceCompareRefresh(c *gin.Context) {
 	pcStartAutoRefresh()
 	pcLoadCacheOnce()
+	var body struct {
+		Stages []string `json:"stages"`
+	}
+	if c.Request.Body != nil {
+		_ = c.ShouldBindJSON(&body) // 空/非 JSON body 容忍：视为全阶段刷新
+	}
 	pcMu.Lock()
 	running := pcRefresh.Running
 	pcMu.Unlock()
@@ -5893,7 +6026,7 @@ func PostPriceCompareRefresh(c *gin.Context) {
 		c.JSON(200, gin.H{"success": true, "data": gin.H{"running": true}})
 		return
 	}
-	pcRunRefresh(true)
+	pcRunRefresh(true, body.Stages)
 	c.JSON(200, gin.H{"success": true, "data": gin.H{"running": true}})
 }
 
@@ -5901,7 +6034,7 @@ func PostPriceCompareRefresh(c *gin.Context) {
 func PostPriceCompareAutoRuleApply(c *gin.Context) {
 	pcStartAutoRefresh()
 	pcLoadCacheOnce()
-	models, offers, missing, channels, routes, harness, dropped := pcApplyAutoRule(true)
+	models, offers, missing, channels, routes, harness, dropped := pcApplyAutoRule(true, nil)
 	c.JSON(200, gin.H{"success": true, "data": gin.H{
 		"models": models, "offers": offers, "missing": missing,
 		"channels": channels, "routes": routes, "harness": harness,

@@ -510,13 +510,15 @@ func pcTestOfferCore(kind, ref, provider, quant string, strictAccess bool) pcTes
 // pcTestOffersParallel 并行测一批报价（conc 并发；<=0 取 8），返回候选 key → 结果。
 // ttl=结果缓存时长（apply 批量 6h：同一轮自动更新内不重复花钱）；strictKinds 里
 // 的渠道在 access 数据可用时零成本预判剔除。并发是给上游限流的节流阀：批量
-// 打同一账号时建议 4，避免挤占生产流量的每分钟配额
-func pcTestOffersParallel(cands []pcTestCand, ttl time.Duration, strictKinds map[string]bool, conc int) map[string]pcTestOfferResult {
+// 打同一账号时建议 4，避免挤占生产流量的每分钟配额。onProgress 可选（可为 nil）：
+// 每完成一例回调 (done, total)，供刷新流水线上报阶段子进度
+func pcTestOffersParallel(cands []pcTestCand, ttl time.Duration, strictKinds map[string]bool, conc int, onProgress func(done, total int)) map[string]pcTestOfferResult {
 	if conc <= 0 {
 		conc = 8
 	}
 	out := make(map[string]pcTestOfferResult, len(cands))
 	var mu sync.Mutex
+	done := 0
 	sem := make(chan struct{}, conc)
 	var wg sync.WaitGroup
 	for _, c := range cands {
@@ -528,7 +530,12 @@ func pcTestOffersParallel(cands []pcTestCand, ttl time.Duration, strictKinds map
 			r := pcTestOfferCached(c.Kind, c.Ref, c.Provider, c.Quant, ttl, strictKinds[c.Kind])
 			mu.Lock()
 			out[c.key()] = r
+			done++
+			d := done
 			mu.Unlock()
+			if onProgress != nil {
+				onProgress(d, len(cands))
+			}
 		}(c)
 	}
 	wg.Wait()

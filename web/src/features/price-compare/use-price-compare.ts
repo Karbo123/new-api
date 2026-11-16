@@ -373,6 +373,37 @@ export const PC_REFRESH_INTERVALS = [
   { value: 'never', label: 'Never' },
 ]
 
+// 刷新流水线阶段表：key 与后端 pcStages 一一对应，顺序即流水线从左到右的执行
+// 顺序（勾选弹窗的展示顺序与此一致）。label 走 i18n；后端 status 里的 label 仅作
+// 无注册表时的兜底
+export const PC_REFRESH_STAGES: { key: string; label: string; detail: string }[] = [
+  {
+    key: 'sources',
+    label: 'Fetch market sources',
+    detail: 'FX · balances · channel model prices · leaderboards (17 in parallel)',
+  },
+  {
+    key: 'catalog',
+    label: 'OpenRouter catalog & provider prices',
+    detail: 'Slowest step: per-model provider offer fetch',
+  },
+  {
+    key: 'unified',
+    label: 'Rebuild unified market',
+    detail: 'Merge channel quotes, persist cache',
+  },
+  {
+    key: 'free_test',
+    label: 'Live-test free-tier offers',
+    detail: 'Real calls to free offers (4-way parallel)',
+  },
+  {
+    key: 'auto_rule',
+    label: 'Apply auto-update rule',
+    detail: 'Rebuild priority list → channels / routes / harness sync',
+  },
+]
+
 export function usePriceCompare() {
   const { t } = useTranslation()
   const queryClient = useQueryClient()
@@ -551,11 +582,11 @@ export function usePriceCompare() {
     [persistConfig]
   )
 
-  // 手动刷新 + 轮询进度
-  const triggerRefresh = useCallback(async () => {
+  // 手动刷新（可只勾选部分流水线阶段）+ 轮询进度
+  const triggerRefresh = useCallback(async (stages?: string[]) => {
     try {
       setRefreshing(true)
-      await postPcRefresh()
+      await postPcRefresh(stages)
       setRefreshStatus({
         running: true,
         done: 0,
@@ -568,6 +599,26 @@ export function usePriceCompare() {
       setRefreshing(false)
     }
   }, [t])
+
+  // 页面加载时同步一次后台刷新状态：自动定时刷新在后台跑时（例如页面刚打开）
+  // 也能立即显示流水线进度，而不是进度条消失
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      try {
+        const st = await getPcRefreshStatus()
+        if (!cancelled && st.running) {
+          setRefreshStatus(st)
+          setRefreshing(true)
+        }
+      } catch {
+        /* ignore */
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   useEffect(() => {
     if (!refreshing) return

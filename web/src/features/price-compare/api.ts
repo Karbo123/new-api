@@ -48,8 +48,9 @@ export async function savePcPriority(
   return res.data.data as PcPriorityConfig
 }
 
-export async function postPcRefresh(): Promise<PcRefreshStatus> {
-  const res = await api.post('/api/price_compare/refresh')
+// stages：勾选的阶段 key 列表（缺省/空 = 全部阶段）
+export async function postPcRefresh(stages?: string[]): Promise<PcRefreshStatus> {
+  const res = await api.post('/api/price_compare/refresh', { stages: stages ?? [] })
   return res.data.data as PcRefreshStatus
 }
 
