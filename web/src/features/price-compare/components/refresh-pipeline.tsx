@@ -71,7 +71,8 @@ function StageNode({ stage, index }: { stage: PcRefreshStageState; index: number
     (stage.status === 'running' || stage.status === 'done') &&
     (stage.total ?? 0) > 0
   return (
-    <div className='flex w-[88px] shrink-0 flex-col items-center gap-1 sm:w-[104px]'>
+    // 弹性宽度：随容器收窄（窄弹窗不裁切），宽容器由连接线吃掉剩余空间
+    <div className='flex min-w-0 flex-1 flex-col items-center gap-1'>
       <div
         className={cn(
           'relative flex h-7 w-7 items-center justify-center rounded-full border-2 transition-colors',
@@ -123,14 +124,16 @@ function StageNode({ stage, index }: { stage: PcRefreshStageState; index: number
 }
 
 // 左→右流水线：节点 = 刷新阶段（顺序 = 执行顺序），节点间连线在上游阶段完成
-// 后点亮。一个节点内部可能有多路并行子操作，以 done/total 计数表达
+// 后点亮。一个节点内部可能有多路并行子操作，以 done/total 计数表达。
+// 节点 flex-1 弹性、连接线限宽（min-w-3 max-w-10）——窄容器节点收窄折行，
+// 宽容器连接线伸展，任何宽度都不裁切
 export function RefreshPipeline({ stages }: { stages: PcRefreshStageState[] }) {
   return (
     <div className='flex w-full items-start'>
       {stages.map((s, i) => (
         <Fragment key={s.key}>
           {i > 0 && (
-            <div className='mt-3.5 min-w-2 flex-1 px-0.5'>
+            <div className='mt-3.5 min-w-3 max-w-10 flex-1 px-0.5'>
               <div
                 className={cn(
                   'h-0.5 rounded-full transition-colors duration-500',
