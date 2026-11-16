@@ -5719,125 +5719,137 @@ func pcRunRefresh(force bool, sel []string) {
 				}
 			})
 		}
-		// 阶段一：独立数据源并行抓取（各源写缓存均有 pcMu 保护），OR 目录+
-		// 供应商价依赖面大放在下一阶段串行。每源带 8 分钟硬看门狗：个别源挂死
+		// 阶段一+二【并行】执行：catalog 只读 OpenRouter 自己的接口，与 sources
+		// 的 17 项抓取互不依赖（slug 对照表只被阶段四/五的实测钉扎与路由消费，
+		// 届时两阶段均已结束，无需在此排序）。阶段三「重建统一行情」是真正的
+		// 汇合点，等两阶段全部完成后才开始。每源带 8 分钟硬看门狗：个别源挂死
 		// （无超时的底层连接、站方假死）不再拖死整条流水线，超时记日志后放弃等待
-		runStage("sources", func(report func(current string, done, total int)) {
-			const pcSourceWatchdog = 8 * time.Minute
-			tasks := []struct {
-				name string
-				fn   func()
-			}{
-				{"汇率", func() { pcFetchExchange(true) }},
-				{"余额", func() { pcFetchBalances() }}, // 余额也按「自动从网络抓取」间隔预查，面板打开即缓存命中
-				{"OpenCode Go", func() { pcFetchGoModels(true) }},
-				{"DeepSeek 别名", func() { pcFetchDsFlashAlias(true) }},
-				{"DeepSeek 官方", func() { pcFetchDeepseek(true) }},
-				{"LiveBench", func() { pcFetchLivebench(true) }},
-				{"Agent Arena", func() { pcFetchArena(true) }},
-				{"OR 用量榜", func() { pcFetchOrRankings(true) }},
-				{"AA 指数", func() { pcFetchAA(true) }},
-				{"Design Arena", func() { pcFetchDesignArena(true) }},
-				{"司南", func() { pcFetchOpenCompass(true) }},
-				{"LLM Stats", func() { pcFetchLlmStats(true) }},
-				{"AI IQ", func() { pcFetchAiq(true) }},
-				{"BuzzAI", func() { pcFetchBuzzaiModels(true) }},
-				{"APIKL", func() { pcFetchApiklModels(true) }},
-				{"IKUN", func() { pcFetchIkunModels(true) }},
-				{"OR 供应商表", func() { pcFetchOrProviderSlugs() }},
-				// APIB（apib.ai）定价走站内 Next.js RSC 私有通道，对服务器端请求 307
-				// 门禁（须浏览器会话 cookie），暂无稳定公开接口，未接入定价行情
-			}
-			var mu sync.Mutex
-			done := 0
-			inflight := map[string]bool{}
-			// 进行中名单：上报当前在跑的源名（含刚完成的），卡源一眼可见
-			reportState := func(justDone string) {
-				mu.Lock()
-				names := make([]string, 0, len(inflight))
-				for k := range inflight {
-					names = append(names, k)
+		var wgSc sync.WaitGroup
+		wgSc.Add(2)
+		go func() {
+			defer wgSc.Done()
+			runStage("sources", func(report func(current string, done, total int)) {
+				const pcSourceWatchdog = 8 * time.Minute
+				tasks := []struct {
+					name string
+					fn   func()
+				}{
+					{"汇率", func() { pcFetchExchange(true) }},
+					{"余额", func() { pcFetchBalances() }}, // 余额也按「自动从网络抓取」间隔预查，面板打开即缓存命中
+					{"OpenCode Go", func() { pcFetchGoModels(true) }},
+					{"DeepSeek 别名", func() { pcFetchDsFlashAlias(true) }},
+					{"DeepSeek 官方", func() { pcFetchDeepseek(true) }},
+					{"LiveBench", func() { pcFetchLivebench(true) }},
+					{"Agent Arena", func() { pcFetchArena(true) }},
+					{"OR 用量榜", func() { pcFetchOrRankings(true) }},
+					{"AA 指数", func() { pcFetchAA(true) }},
+					{"Design Arena", func() { pcFetchDesignArena(true) }},
+					{"司南", func() { pcFetchOpenCompass(true) }},
+					{"LLM Stats", func() { pcFetchLlmStats(true) }},
+					{"AI IQ", func() { pcFetchAiq(true) }},
+					{"BuzzAI", func() { pcFetchBuzzaiModels(true) }},
+					{"APIKL", func() { pcFetchApiklModels(true) }},
+					{"IKUN", func() { pcFetchIkunModels(true) }},
+					{"OR 供应商表", func() { pcFetchOrProviderSlugs() }},
+					// APIB（apib.ai）定价走站内 Next.js RSC 私有通道，对服务器端请求 307
+					// 门禁（须浏览器会话 cookie），暂无稳定公开接口，未接入定价行情
 				}
-				sort.Strings(names)
-				d := done
-				mu.Unlock()
-				msg := fmt.Sprintf("并行抓取 %d/%d", d, len(tasks))
-				if justDone != "" {
-					msg += fmt.Sprintf("（%s 完成）", justDone)
+				var mu sync.Mutex
+				done := 0
+				inflight := map[string]bool{}
+				// 进行中名单：上报当前在跑的源名（含刚完成的），卡源一眼可见
+				reportState := func(justDone string) {
+					mu.Lock()
+					names := make([]string, 0, len(inflight))
+					for k := range inflight {
+						names = append(names, k)
+					}
+					sort.Strings(names)
+					d := done
+					mu.Unlock()
+					msg := fmt.Sprintf("并行抓取 %d/%d", d, len(tasks))
+					if justDone != "" {
+						msg += fmt.Sprintf("（%s 完成）", justDone)
+					}
+					if len(names) > 0 {
+						msg += " · 进行中: " + strings.Join(names, "、")
+					}
+					report(msg, d, len(tasks))
 				}
-				if len(names) > 0 {
-					msg += " · 进行中: " + strings.Join(names, "、")
+				// 每源一个事件（正常完成 / 看门狗放弃），主循环收满 len(tasks) 个即
+				// 进入下一阶段；超时后迟到的真实完成只会滞留缓冲，不会被重复计数
+				type srcEvent struct {
+					name  string
+					valid bool
 				}
-				report(msg, d, len(tasks))
-			}
-			// 每源一个事件（正常完成 / 看门狗放弃），主循环收满 len(tasks) 个即
-			// 进入下一阶段；超时后迟到的真实完成只会滞留缓冲，不会被重复计数
-			type srcEvent struct {
-				name  string
-				valid bool
-			}
-			events := make(chan srcEvent, len(tasks))
-			for _, t := range tasks {
-				mu.Lock()
-				inflight[t.name] = true
-				mu.Unlock()
-				go func(name string, fn func()) {
-					finished := make(chan struct{})
-					go func() {
-						select {
-						case <-finished:
-						case <-time.After(pcSourceWatchdog):
-							common.SysError("price_compare refresh source watchdog: " + name + " 超时放弃（" + fmt.Sprint(pcSourceWatchdog) + "）")
-							mu.Lock()
-							delete(inflight, name)
-							mu.Unlock()
-							events <- srcEvent{name, false}
+				events := make(chan srcEvent, len(tasks))
+				for _, t := range tasks {
+					mu.Lock()
+					inflight[t.name] = true
+					mu.Unlock()
+					go func(name string, fn func()) {
+						finished := make(chan struct{})
+						go func() {
+							select {
+							case <-finished:
+							case <-time.After(pcSourceWatchdog):
+								common.SysError("price_compare refresh source watchdog: " + name + " 超时放弃（" + fmt.Sprint(pcSourceWatchdog) + "）")
+								mu.Lock()
+								delete(inflight, name)
+								mu.Unlock()
+								events <- srcEvent{name, false}
+							}
+						}()
+						fn()
+						close(finished)
+						events <- srcEvent{name, true}
+					}(t.name, t.fn)
+				}
+				reportState("")
+				for i := 0; i < len(tasks); i++ {
+					ev := <-events
+					mu.Lock()
+					delete(inflight, ev.name)
+					done++
+					mu.Unlock()
+					reportState(ev.name)
+				}
+				pcSaveCache() // 抓取结果落盘（catalog 被跳过时也要保住本轮抓到的数据）
+			})
+		}()
+		go func() {
+			defer wgSc.Done()
+			// 阶段二：OR 目录 + 逐模型供应商报价（大头，force 时全量、否则只补
+			// 缺失/过期）。与阶段一并行执行
+			runStage("catalog", func(report func(current string, done, total int)) {
+				pcFetchCatalog(force)
+				if force {
+					pcPrefetchOr(true, func(_ string, done, total int) {
+						report("OpenRouter 供应商价", done, total)
+					})
+				} else {
+					// 只补缺失/过期的
+					pcMu.Lock()
+					staleIds := []string{}
+					for _, m := range pcCache.Models {
+						if strings.HasPrefix(m.Id, "~") || strings.HasPrefix(m.Id, "openrouter/") {
+							continue
 						}
-					}()
-					fn()
-					close(finished)
-					events <- srcEvent{name, true}
-				}(t.name, t.fn)
-			}
-			reportState("")
-			for i := 0; i < len(tasks); i++ {
-				ev := <-events
-				mu.Lock()
-				delete(inflight, ev.name)
-				done++
-				mu.Unlock()
-				reportState(ev.name)
-			}
-			pcSaveCache() // 抓取结果落盘（catalog 被跳过时也要保住本轮抓到的数据）
-		})
-		// 阶段二：OR 目录 + 逐模型供应商报价（大头，force 时全量、否则只补缺失/过期）
-		runStage("catalog", func(report func(current string, done, total int)) {
-			pcFetchCatalog(force)
-			if force {
-				pcPrefetchOr(true, func(_ string, done, total int) {
-					report("OpenRouter 供应商价", done, total)
-				})
-			} else {
-				// 只补缺失/过期的
-				pcMu.Lock()
-				staleIds := []string{}
-				for _, m := range pcCache.Models {
-					if strings.HasPrefix(m.Id, "~") || strings.HasPrefix(m.Id, "openrouter/") {
-						continue
+						p, ok := pcCache.Prices[m.Id]
+						if !ok || len(p.Providers) == 0 || time.Now().Unix()-p.FetchedAt > pcPricesTTL {
+							staleIds = append(staleIds, m.Id)
+						}
 					}
-					p, ok := pcCache.Prices[m.Id]
-					if !ok || len(p.Providers) == 0 || time.Now().Unix()-p.FetchedAt > pcPricesTTL {
-						staleIds = append(staleIds, m.Id)
+					pcMu.Unlock()
+					for i, id := range staleIds {
+						report(id, i+1, len(staleIds))
+						pcFetchOrPrice(id, false)
 					}
 				}
-				pcMu.Unlock()
-				for i, id := range staleIds {
-					report(id, i+1, len(staleIds))
-					pcFetchOrPrice(id, false)
-				}
-			}
-			pcSaveCache()
-		})
+				pcSaveCache()
+			})
+		}()
+		wgSc.Wait()
 		// 阶段三：汇总各渠道报价重建统一行情（内存重建+落盘，无外网请求）
 		runStage("unified", func(report func(current string, done, total int)) {
 			report("重建统一行情", 0, 1)
@@ -5848,8 +5860,14 @@ func pcRunRefresh(force bool, sel []string) {
 		// 按实测而非后缀判定（供应商免费档是否可用只有真实调用说了算）。
 		// max_tokens=1 打免费/报错请求成本≈0；结果进连通性测试缓存（30 分钟，
 		// 与 apply 的过滤共用存储）。基础设施性失败（本地断网等）≥25% 且 ≥5 例
-		// 时熔断不标记，防止把全场报价误杀
+		// 时熔断不标记，防止把全场报价误杀。
+		// 与阶段五【有意串行】（不做并行）：两者共享连通性测试缓存——先免费实测
+		// 再 apply，apply 对免费档直接复用 30 分钟缓存结果不再重付；若并行会对
+		// 同一 OR 账号叠 4+8 路测试流量，挤占同 key 生产流量的每分钟配额
 		runStage("free_test", func(report func(current string, done, total int)) {
+			if pcOrSlugMap.Load() == nil {
+				pcFetchOrProviderSlugs() // 用户跳过阶段一时兜底：实测钉扎需要 slug 表
+			}
 			rows, _ := pcGetUnified(false)
 			cands := []pcTestCand{}
 			seen := map[string]bool{}
@@ -5912,6 +5930,9 @@ func pcRunRefresh(force bool, sel []string) {
 		// 阶段五：自动更新规则——按规则重建优先级列表并同步渠道/路由/harness
 		// （规则关闭时内部直接跳过）
 		runStage("auto_rule", func(report func(current string, done, total int)) {
+			if pcOrSlugMap.Load() == nil {
+				pcFetchOrProviderSlugs() // 用户跳过阶段一/四时兜底：路由钉扎需要 slug 表
+			}
 			report("重建优先级列表", 0, 0)
 			pcApplyAutoRule(false, func(done, total int) {
 				report("连通性实测", done, total)
