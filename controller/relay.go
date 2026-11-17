@@ -474,6 +474,31 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 			if e != nil || ch == nil || !ch.ChannelInfo.IsMultiKey {
 				return
 			}
+			// 保底一把：本次拉黑后将无任何 enabled key（如上游池子额度耗尽连拒
+			// 全部 key）时跳过——保留一把哨兵 key 继续轮询，池子恢复后请求自动
+			// 痊愈；真欠费时哨兵也失败，但跨渠道 fallback 会兜底，且全禁死锁
+			// （无人可被试探、auto-recover 永不触发）不再发生
+			usingIdx := -1
+			keys := strings.Split(ch.Key, "\n")
+			for i, k := range keys {
+				if strings.TrimSpace(k) == channelError.UsingKey {
+					usingIdx = i
+					break
+				}
+			}
+			enabledLeft := 0
+			for i := range keys {
+				if i == usingIdx {
+					continue
+				}
+				if st, ok := ch.ChannelInfo.MultiKeyStatusList[i]; !ok || st == common.ChannelStatusEnabled {
+					enabledLeft++
+				}
+			}
+			if usingIdx >= 0 && enabledLeft == 0 {
+				common.SysLog(fmt.Sprintf("multi-key auto-disable skipped: channel #%d keeps last enabled key as sentinel (upstream pool may recover)", channelError.ChannelId))
+				return
+			}
 			if model.UpdateChannelStatus(channelError.ChannelId, channelError.UsingKey,
 				common.ChannelStatusManuallyDisabled, model.MultiKeyAutoDisableReason) {
 				common.SysLog(fmt.Sprintf("multi-key auto-disable: channel #%d one key marked disabled (insufficient balance, no key value logged)",
