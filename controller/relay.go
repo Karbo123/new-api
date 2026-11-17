@@ -199,6 +199,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if channelErr != nil {
 			logger.LogError(c, channelErr.Error())
 			newAPIError = channelErr
+			// 多 key 渠道全部 key 被禁（欠费拉黑等）：换下一候选渠道再试，
+			// 而不是把首选渠道的 key 状态直接当终态返回给调用方
+			if channelErr.GetErrorCode() == types.ErrorCodeChannelNoAvailableKey &&
+				retryParam.GetRetry() < common.RetryTimes {
+				continue // post 语句自动推进重试序号，下一轮候选渠道
+			}
 			break
 		}
 		addUsedChannel(c, channel.Id)
