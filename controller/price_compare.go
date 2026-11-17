@@ -4234,11 +4234,14 @@ func pcSyncChannelKeys() ([]pcKeyConflict, int) {
 					}
 				}
 			}
-			// Harness 显示名（去厂商前缀+（¥价））同样要能路由：每个提供该模型的
-			// 管理渠道都收录显示名并映射回本渠道自己的上游名——请求打到哪里都能
-			// 换算成该渠道的真实 ref，阶段化 fallback 的后续渠道也因此可用
+			// 统一裸名（条目名，ZCode/面板实际请求的名字）要能路由：每个提供该模型
+			// 的管理渠道都收录条目名并映射回本渠道自己的上游名。条目名可能≠首报价
+			// 的 harness 名（最低价报价被连通性剔除后 offers[0] 换人：如
+			// claude-opus-5.5 点号条目名 vs apikl/ikun 连字符 ref）——只登记 harness
+			// 名会让点号名 503 No available channel。旧 harness 名一并保留，兼容
+			// 还没刷新的旧 harness 配置
 			for _, e := range pri.Entries {
-				if len(e.Offers) == 0 || e.Offers[0].Harness == "" {
+				if len(e.Offers) == 0 {
 					continue
 				}
 				own := ""
@@ -4251,12 +4254,18 @@ func pcSyncChannelKeys() ([]pcKeyConflict, int) {
 				if own == "" {
 					continue // 本渠道不提供该模型，无需注册
 				}
-				h := e.Offers[0].Harness
-				if !seenRef[h] {
-					seenRef[h] = true
-					models = append(models, h)
+				for _, h := range []string{e.Name, e.Offers[0].Harness} {
+					if h == "" {
+						continue
+					}
+					if !seenRef[h] {
+						seenRef[h] = true
+						models = append(models, h)
+					}
+					if h != own {
+						mapping[h] = own
+					}
 				}
-				mapping[h] = own
 			}
 			ch.Models = strings.Join(models, ",")
 			if b, err := json.Marshal(mapping); err == nil {
@@ -5211,6 +5220,12 @@ func pcBuildRouteTable(entries map[string]pcPriorityEntry) (map[string][]int, ma
 		var flat []flatStage
 		seenStage := map[flatStage]bool{}
 		names := map[string]bool{k: true, pcCanonKey(k): true}
+		// 条目名（统一裸名）与其 canon 键同样入集：条目名可能≠任何 offer 的
+		// ref/harness（最低价报价被剔除后的名字分裂），路由 hook 必须认得它
+		if entry.Name != "" {
+			names[entry.Name] = true
+			names[pcCanonKey(entry.Name)] = true
+		}
 		for _, of := range entry.Offers {
 			names[of.Ref] = true
 			names[pcCanonKey(of.Ref)] = true
