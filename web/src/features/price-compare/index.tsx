@@ -102,7 +102,11 @@ export function PriceCompare() {
               role='button'
               tabIndex={0}
               onKeyDown={(e) => {
-                if (e.key === 'Enter' || e.key === ' ') setRefreshOpen(true)
+                // 仅响应容器自身的按键：阶段节点按钮的 Enter/空格已切换详情，
+                // 不再冒泡弹出刷新弹窗
+                if ((e.key === 'Enter' || e.key === ' ') && e.target === e.currentTarget) {
+                  setRefreshOpen(true)
+                }
               }}
             >
               <RefreshPipelineCard status={pc.refreshStatus} />

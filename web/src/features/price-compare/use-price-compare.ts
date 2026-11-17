@@ -584,19 +584,17 @@ export function usePriceCompare() {
 
   // 手动刷新（可只勾选部分流水线阶段）+ 轮询进度
   const triggerRefresh = useCallback(async (stages?: string[]) => {
+    // 伪状态与 refreshing 同步写入：POST 在途时进度视图显示空流水线骨架，
+    // 而不是上一轮终态（或首用时的空白）
+    setRefreshing(true)
+    setRefreshStatus({ running: true, done: 0, total: 0, current: '', finished: false })
     try {
-      setRefreshing(true)
       await postPcRefresh(stages)
-      setRefreshStatus({
-        running: true,
-        done: 0,
-        total: 0,
-        current: '',
-        finished: false,
-      })
     } catch {
       toast.error(t('Failed to trigger refresh'))
+      // 伪状态要清掉：否则残留的上一轮 finished=true 会把弹窗错切到结果视图
       setRefreshing(false)
+      setRefreshStatus(null)
     }
   }, [t])
 
@@ -622,9 +620,16 @@ export function usePriceCompare() {
 
   useEffect(() => {
     if (!refreshing) return
+    let stop = false
+    let busy = false
     const timer = setInterval(async () => {
+      // 防重入：上一次轮询未返回不重复发——结束瞬间不会双 toast/双 invalidate，
+      // 慢响应乱序返回也不会用旧快照覆盖终态
+      if (busy) return
+      busy = true
       try {
         const st = await getPcRefreshStatus()
+        if (stop) return
         setRefreshStatus(st)
         if (!st.running) {
           setRefreshing(false)
@@ -633,9 +638,14 @@ export function usePriceCompare() {
         }
       } catch {
         /* ignore */
+      } finally {
+        busy = false
       }
     }, 2000)
-    return () => clearInterval(timer)
+    return () => {
+      stop = true
+      clearInterval(timer)
+    }
   }, [refreshing, queryClient, t])
 
   // unified 空数据（后端预热/重建中）每 5 秒轮询。后端 refresh 还在跑时无限轮询

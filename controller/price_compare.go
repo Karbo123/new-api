@@ -387,8 +387,8 @@ type pcRefreshStage struct {
 	Key     string        `json:"key"`
 	Label   string        `json:"label"`
 	Status  string        `json:"status"`
-	Done    int           `json:"done,omitempty"`
-	Total   int           `json:"total,omitempty"`
+	Done    int           `json:"done"`
+	Total   int           `json:"total"`
 	Current string        `json:"current,omitempty"`
 	Error   string        `json:"error,omitempty"`
 	Info    []string      `json:"info,omitempty"`  // 阶段摘要信息行（面板点开详情展示）
@@ -464,6 +464,31 @@ func (r *pcStageReporter) items(items []pcStageItem) {
 // info 覆盖阶段摘要信息行
 func (r *pcStageReporter) info(lines []string) {
 	pcRefreshSet(func(st *pcRefreshState) { st.Stages[r.idx].Info = lines })
+}
+
+// pcRefreshSnapshot 在 pcMu 内产出 pcRefresh 的深拷贝快照（Stages 含 Items/Info
+// 内层切片）。浅拷贝只复制切片头、与刷新 goroutine 共享底层数组，锁外 marshal
+// 与锁内原地写并发会撕裂 string/slice 头（轻则响应乱码、重则序列化 panic）——
+// 状态查询接口必须用快照后在锁外序列化
+func pcRefreshSnapshot() pcRefreshState {
+	pcMu.Lock()
+	defer pcMu.Unlock()
+	st := pcRefresh
+	if len(st.Stages) > 0 {
+		sts := make([]pcRefreshStage, len(st.Stages))
+		for i, s := range st.Stages {
+			s2 := s
+			if len(s.Items) > 0 {
+				s2.Items = append([]pcStageItem(nil), s.Items...)
+			}
+			if len(s.Info) > 0 {
+				s2.Info = append([]string(nil), s.Info...)
+			}
+			sts[i] = s2
+		}
+		st.Stages = sts
+	}
+	return st
 }
 
 func pcDataDir() string {
@@ -4098,7 +4123,14 @@ type pcKeyConflict struct {
 // 管理渠道，key（多 key 换行分隔 + channel_info 标记）/models/base_url/供应商路由
 // 参数全部强制覆盖；OpenRouter 管理渠道带 provider.sort=price（按价格顺序尝试供应商）。
 // 随后检测使用相同 key 的非管理渠道作为冲突返回，由用户确认删除。
+// pcSyncKeysMu 串行化渠道同步的读-改-写（读优先级文件/渠道行 → 内存改 → 整行
+// Update+重建 abilities）：手动保存/导入保险箱与定时刷新 auto_rule 阶段并发触发
+// 时，慢者的旧一代 models/model_mapping 会覆盖新一代，造成新条目 503 到下次同步
+var pcSyncKeysMu sync.Mutex
+
 func pcSyncChannelKeys() ([]pcKeyConflict, int) {
+	pcSyncKeysMu.Lock()
+	defer pcSyncKeysMu.Unlock()
 	conflicts := []pcKeyConflict{}
 	touched := 0
 	if model.DB == nil {
@@ -4827,6 +4859,11 @@ func pcFetchBalances() {
 	pcBalMu.Unlock()
 }
 
+// pcCacheFileMu 串行化 cache.json 落盘：sources/catalog 两阶段并行收尾时各自调
+// pcSaveCache，裸 os.WriteFile（O_TRUNC+write）并发交错会写出撕裂 JSON——
+// 同类风险在 unified.json 已有 pcUnifiedFileMu 先例
+var pcCacheFileMu sync.Mutex
+
 func pcSaveCache() {
 	pcMu.Lock()
 	b, err := json.Marshal(&pcCache)
@@ -4834,7 +4871,18 @@ func pcSaveCache() {
 	if err != nil {
 		return
 	}
-	_ = os.WriteFile(pcCacheFile(), b, 0644)
+	pcCacheFileMu.Lock()
+	defer pcCacheFileMu.Unlock()
+	// 临时文件+rename 原子替换：并发窗口之外，进程中途挂掉也不留半截 JSON
+	tmp := pcCacheFile() + ".tmp"
+	if err := os.WriteFile(tmp, b, 0644); err != nil {
+		_ = os.Remove(tmp)
+		return
+	}
+	if err := os.Rename(tmp, pcCacheFile()); err != nil {
+		// rename 失败（极少）：退回直写，仍受 pcCacheFileMu 保护
+		_ = os.WriteFile(pcCacheFile(), b, 0644)
+	}
 	pcDbSet(pcDbCacheKey, string(b))
 }
 
@@ -4851,7 +4899,12 @@ func pcLoadCache() {
 	}
 	var c pcCacheData
 	if json.Unmarshal(b, &c) != nil {
-		return
+		// 文件损坏（历史撕裂残留等）时从实例数据库恢复：DB 副本每次保存都是完整
+		// JSON，只因文件存在就放弃会白白清零缓存、触发全量重抓
+		s := pcDbGet(pcDbCacheKey)
+		if s == "" || json.Unmarshal([]byte(s), &c) != nil {
+			return
+		}
 	}
 	if c.Canonical == nil {
 		c.Canonical = map[string]string{}
@@ -5827,12 +5880,15 @@ func pcRunRefresh(force bool, sel []string) {
 					rep.progress(msg, d, len(tasks))
 					rep.items(cp)
 				}
-				// 每源一个事件（正常完成 / 看门狗放弃），主循环收满 len(tasks) 个即
-				// 进入下一阶段；超时后迟到的真实完成只会滞留缓冲，不会被重复计数
+				// 每源恰好一个事件（正常完成 / 看门狗放弃，fired CAS 保证二者互斥），
+				// 主循环收满 len(tasks) 个即进入下一阶段。无互斥时同一源可能双发：
+				// fn 恰在 8 分钟边界返回时看门狗 select 随机走超时分支补发超时事件，
+				// 双计会让主循环提前收满、把另一个仍在抓取的源整体放弃
 				type srcEvent struct {
 					name  string
 					valid bool
 				}
+				fired := make([]int32, len(tasks))
 				events := make(chan srcEvent, len(tasks))
 				for _, t := range tasks {
 					go func(name string, fn func()) {
@@ -5845,12 +5901,16 @@ func pcRunRefresh(force bool, sel []string) {
 								mu.Lock()
 								states[idxOf[name]] = pcStageItem{Name: name, Status: "failed", Note: "看门狗超时放弃（源挂死）"}
 								mu.Unlock()
-								events <- srcEvent{name, false}
+								if atomic.CompareAndSwapInt32(&fired[idxOf[name]], 0, 1) {
+									events <- srcEvent{name, false}
+								}
 							}
 						}()
 						fn()
 						close(finished)
-						events <- srcEvent{name, true}
+						if atomic.CompareAndSwapInt32(&fired[idxOf[name]], 0, 1) {
+							events <- srcEvent{name, true}
+						}
 					}(t.name, t.fn)
 				}
 				reportState("")
@@ -5905,8 +5965,8 @@ func pcRunRefresh(force bool, sel []string) {
 					pcMu.Unlock()
 					rep.info([]string{fmt.Sprintf("模式: 补漏 · 过期/缺失模型: %d", len(staleIds))})
 					for i, id := range staleIds {
-						rep.progress(id, i+1, len(staleIds))
 						pcFetchOrPrice(id, false)
+						rep.progress(id, i+1, len(staleIds)) // 抓完再报：进度不超前实际完成数
 					}
 				}
 				pcSaveCache()
@@ -6133,9 +6193,10 @@ func GetPriceCompareUnified(c *gin.Context) {
 	pcStartAutoRefresh()
 	pcLoadCacheOnce()
 	rows, at := pcGetUnified(false)
-	// 带上后台任务状态与 LLM Stats 基准元数据（id→展示名，前端动态维度用）
+	// 带上后台任务状态与 LLM Stats 基准元数据（id→展示名，前端动态维度用）。
+	// refresh 状态必须取深拷贝快照：锁外 marshal 不能与刷新流水线的原地写共享底层数组
+	st := pcRefreshSnapshot()
 	pcMu.Lock()
-	st := pcRefresh
 	benchMeta := map[string]string{}
 	for _, b := range pcCache.LsBoards {
 		benchMeta[b.ID] = b.Name
@@ -6530,8 +6591,6 @@ func GetPriceCompareMapping(c *gin.Context) {
 }
 
 func GetPriceCompareRefreshStatus(c *gin.Context) {
-	pcMu.Lock()
-	st := pcRefresh
-	pcMu.Unlock()
+	st := pcRefreshSnapshot()
 	c.JSON(200, gin.H{"success": true, "data": st})
 }
