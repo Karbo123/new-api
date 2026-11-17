@@ -113,6 +113,11 @@ func main() {
 	go model.SyncOptions(common.SyncFrequency)
 	go controller.SyncTaskPlugins()
 
+	// 比价子系统预热：加载缓存 + 探测逐 key 可见模型并发布 key 级路由注册表。
+	// 注册表在内存、重启即空，不预热则头几分钟多 key 渠道回退默认轮询、
+	// 选中分组不含目标模型的 key 直接 404；探测免费（/v1/models）
+	go controller.PcWarmup()
+
 	// 周期性重载授权策略，保证多节点/多 master 部署下权限变更能传播到每个实例
 	go authz.StartPolicySync(common.SyncFrequency)
 

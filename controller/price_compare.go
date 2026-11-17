@@ -6197,10 +6197,18 @@ func pcLoadCacheOnce() {
 		go func() {
 			// 冷启动即重探逐 key 可见模型并发布 key 级路由注册表：注册表在内存、
 			// 重启即空，不重探则头几分钟多 key 渠道回退默认轮询、选中无权限的
-			// key 直接 404（实测踩坑）
+			// key 直接 404（实测踩坑）。进程级预热见 PcWarmup（main.go 启动时调）
 			pcRefreshAccessCache()
 		}()
 	})
+}
+
+// PcWarmup 进程启动预热（main.go）：加载比价缓存并探测逐 key 可见模型、
+// 发布 key 级路由注册表。ZCode 等真实流量不经过比价端点，注册表的冷启动
+// 空窗必须由进程启动时主动消除
+func PcWarmup() {
+	pcLoadCacheOnce()
+	pcRefreshAccessCache()
 }
 
 func GetPriceCompareUnified(c *gin.Context) {
