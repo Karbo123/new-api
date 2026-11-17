@@ -403,6 +403,12 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 		// 重试，而不是当确定性客户端错误直接终止
 		return true
 	}
+	if pcIsPoolModelAbsent(openaiErr) && retryTimes > 0 && !service.GetChannelConstraints(c).SuppressesRetry() {
+		// 转售池（Claude Code OAuth 池子）的「分组无账号」404：池子账号分钟级
+		// 浮动（实测 01:13 六连败 404 → 一分钟后强测 200），同一请求在池子恢复
+		// 后即成功。视为可重试，让跨渠道 fallback 与稍后的轮次接住
+		return true
+	}
 	if openaiErr.GetErrorCode() == types.ErrorCodeChannelNoAvailableKey && retryTimes > 0 && !service.GetChannelConstraints(c).SuppressesRetry() {
 		// 多 key 渠道全部 key 被禁（欠费拉黑等）：换下一候选渠道再试，而不是
 		// 把首选渠道的 key 状态直接当终态返回给调用方
@@ -458,6 +464,18 @@ func pcIsUpstreamPolicyReject(err *types.NewAPIError) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "usage policy") ||
 		strings.Contains(msg, "unable to respond to this request")
+}
+
+// pcIsPoolModelAbsent 转售池「分组暂无账号」404：池子账号分钟级浮动，同一模型
+// 此刻 404 稍后即恢复（用户实测）。与"模型真的不存在"区分：后者文案是
+// not_found/does not exist 且跨渠道稳定复现
+func pcIsPoolModelAbsent(err *types.NewAPIError) bool {
+	if err == nil || err.StatusCode != http.StatusNotFound {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not available for this group") ||
+		strings.Contains(msg, "not supported by any configured account")
 }
 
 func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError, relayInfo *relaycommon.RelayInfo) {
