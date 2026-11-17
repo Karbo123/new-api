@@ -187,29 +187,42 @@ func pcFetchApiklModelsImpl() ([]pcResellerModel, error) {
 	if err := json.Unmarshal([]byte(body), &resp); err != nil {
 		return nil, err
 	}
-	// 同一模型多分组报价取实付最低组（组名进 Note）；充值 1:1（¥1=$1 额度）
-	// → 实付人民币 = 官方$/M × 组倍率
-	best := map[string]*pcResellerModel{}
+	// 分组表：每组 模型名→该组报价（充值 1:1 → 实付人民币 = 官方$/M × 组倍率）
+	groups := make([]pcResellerGroup, 0, len(resp.Data.Groups))
 	for _, g := range resp.Data.Groups {
 		if g.Rate <= 0 {
 			continue
 		}
-		f := g.Rate
+		gr := pcResellerGroup{name: g.Name, rate: g.Rate, models: map[string]bool{}, prices: map[string]pcResellerModel{}}
 		for _, m := range g.Models {
 			if m.Pricing.BillingMode != "token" || m.Pricing.InputPrice == nil {
 				continue // 生图按张计价等不进 token 比价
 			}
-			cand := pcResellerModel{
+			nm := strings.ToLower(m.Name)
+			gr.models[nm] = true
+			gr.prices[nm] = pcResellerModel{
 				Channel: "apikl", Name: m.Name, Currency: "CNY",
-				In:    *m.Pricing.InputPrice * 1e6 * f,
-				Out:   f64v(m.Pricing.OutputPrice) * 1e6 * f,
-				Read:  f64v(m.Pricing.CacheReadPrice) * 1e6 * f,
-				Write: f64v(m.Pricing.CacheWrite) * 1e6 * f,
-				Note:  "组 " + g.Name, GroupRate: f,
+				In:    *m.Pricing.InputPrice * 1e6 * g.Rate,
+				Out:   f64v(m.Pricing.OutputPrice) * 1e6 * g.Rate,
+				Read:  f64v(m.Pricing.CacheReadPrice) * 1e6 * g.Rate,
+				Write: f64v(m.Pricing.CacheWrite) * 1e6 * g.Rate,
+				Note:  "组 " + g.Name, GroupRate: g.Rate,
 			}
-			if prev, ok := best[m.Name]; !ok || cand.In < prev.In {
+		}
+		groups = append(groups, gr)
+	}
+	// 报价只收敛到「保险箱 key 实际所在的分组」：站点最低价组（如 Krio ×0.06）
+	// 可能是别的分组的专属价，我们的 key 在 Claude-Max（×0.8）——照单全收会把
+	// 实际计费低估十几倍。探测缺失时回退全站最低组（note 保持原状）
+	if allowed := pcAllowedResellerGroups("apikl", groups); allowed != nil {
+		groups = allowed
+	}
+	best := map[string]*pcResellerModel{}
+	for _, g := range groups {
+		for nm, cand := range g.prices {
+			if prev, ok := best[nm]; !ok || cand.In < prev.In {
 				cp := cand
-				best[m.Name] = &cp
+				best[nm] = &cp
 			}
 		}
 	}
@@ -228,6 +241,90 @@ func f64v(p *float64) float64 {
 		return 0
 	}
 	return *p
+}
+
+// pcResellerGroup 转售站单个分组的定价表：models 为组内模型名（小写）集合，
+// prices 为模型名 → 该组实付报价
+type pcResellerGroup struct {
+	name   string
+	rate   float64
+	models map[string]bool
+	prices map[string]pcResellerModel
+}
+
+// pcAccessKeyModelSets 逐 key 探测的可见模型集（探测失败的 key 不贡献）。
+// key 的 /v1/models 可见集是其绑定分组的忠实反映（分组白名单），用于把报价
+// 收敛到「保险箱 key 实际所在的分组」
+func pcAccessKeyModelSets(kind string) [][]string {
+	pcAccessMu.Lock()
+	defer pcAccessMu.Unlock()
+	if pcAccessCache.data == nil {
+		return nil
+	}
+	kr, ok := pcAccessCache.data[kind]
+	if !ok {
+		return nil
+	}
+	out := make([][]string, 0, len(kr.Keys))
+	for _, k := range kr.Keys {
+		if !k.Ok {
+			continue
+		}
+		out = append(out, k.Models)
+	}
+	return out
+}
+
+// pcAllowedResellerGroups 按探测可见性把报价候选组收敛到「保险箱 key 实际所在
+// 的分组」：每把 key 用可见模型集与各组模型集做 Jaccard 匹配，命中的组进候选。
+// 分组归属是 key 的稳定属性（不随探测数据老化漂移），所以这里不设新鲜度门槛。
+// 返回 nil = 探测缺失/无法匹配（回退全站最低组，行为同旧版）
+func pcAllowedResellerGroups(kind string, groups []pcResellerGroup) []pcResellerGroup {
+	keySets := pcAccessKeyModelSets(kind)
+	if len(keySets) == 0 || len(groups) == 0 {
+		return nil
+	}
+	allowed := map[int]bool{}
+	for _, vis := range keySets {
+		if len(vis) == 0 {
+			continue
+		}
+		visSet := map[string]bool{}
+		for _, m := range vis {
+			visSet[strings.ToLower(m)] = true
+		}
+		best, bestScore := -1, 0.0
+		for gi := range groups {
+			g := &groups[gi]
+			if len(g.models) == 0 {
+				continue
+			}
+			hit := 0
+			for name := range g.models {
+				if visSet[name] {
+					hit++
+				}
+			}
+			union := len(g.models) + len(visSet) - hit
+			if union == 0 {
+				continue
+			}
+			if score := float64(hit) / float64(union); score > bestScore {
+				best, bestScore = gi, score
+			}
+		}
+		if best >= 0 && bestScore > 0 {
+			allowed[best] = true
+		}
+	}
+	if len(allowed) == 0 {
+		return nil
+	}
+	out := make([]pcResellerGroup, 0, len(allowed))
+	for gi := range allowed {
+		out = append(out, groups[gi])
+	}
+	return out
 }
 
 // ---- APIB（apib.ai）定价抓取 ----
@@ -610,18 +707,17 @@ func pcFetchIkunModelsImpl() ([]pcResellerModel, error) {
 	if creditsPerCny <= 0 {
 		creditsPerCny = pcIkunCnyPerCredit // 服务端未给口径时回退常量
 	}
-	// 每模型取「最低有效价分组」（与站方模型广场「最低分组价」同口径）：
-	// 有效因子 f = 分组倍率 × 每元刀数；同模型多分组出现时取最小 f
-	type pick struct {
-		row pcResellerModel
-		f   float64
-	}
-	best := map[string]pick{}
+	// 分组表：每组 模型名→该组报价（有效因子 f = 分组倍率 × 每元刀数）。
+	// 报价只收敛到「保险箱 key 实际所在的分组」：站点最低价组可能是别的分组
+	// 的专属价（apikl 教训：Krio ×0.06 vs 我们 key 的 Claude-Max ×0.8），照单
+	// 全收会严重低估实际计费。探测缺失时回退全站最低组
+	groups := make([]pcResellerGroup, 0, len(resp.Data.Groups))
 	for _, g := range resp.Data.Groups {
 		if g.Rate <= 0 {
 			continue
 		}
 		f := g.Rate * creditsPerCny
+		gr := pcResellerGroup{name: g.Name, rate: g.Rate, models: map[string]bool{}, prices: map[string]pcResellerModel{}}
 		for _, m := range g.Models {
 			if m.Pricing.BillingMode != "token" || m.Pricing.In == nil || *m.Pricing.In <= 0 {
 				continue
@@ -633,7 +729,9 @@ func pcFetchIkunModelsImpl() ([]pcResellerModel, error) {
 			if write == nil {
 				write = m.Pricing.Write12h
 			}
-			row := pcResellerModel{
+			nm := strings.ToLower(m.Name)
+			gr.models[nm] = true
+			gr.prices[nm] = pcResellerModel{
 				Channel: "ikun", Name: m.Name, Currency: "CNY",
 				In:    f64v(m.Pricing.In) * 1e6 * f,
 				Out:   f64v(m.Pricing.Out) * 1e6 * f,
@@ -641,8 +739,17 @@ func pcFetchIkunModelsImpl() ([]pcResellerModel, error) {
 				Write: f64v(write) * 1e6 * f,
 				Note:  fmt.Sprintf("组 %s ×%g", g.Name, g.Rate), GroupRate: g.Rate,
 			}
-			if prev, ok := best[m.Name]; !ok || f < prev.f {
-				best[m.Name] = pick{row: row, f: f}
+		}
+		groups = append(groups, gr)
+	}
+	if allowed := pcAllowedResellerGroups("ikun", groups); allowed != nil {
+		groups = allowed
+	}
+	best := map[string]pcResellerModel{}
+	for _, g := range groups {
+		for nm, row := range g.prices {
+			if prev, ok := best[nm]; !ok || row.In < prev.In {
+				best[nm] = row
 			}
 		}
 	}
@@ -653,7 +760,7 @@ func pcFetchIkunModelsImpl() ([]pcResellerModel, error) {
 	sort.Strings(names) // 输出顺序稳定（缓存 diff 友好）
 	out := make([]pcResellerModel, 0, len(names))
 	for _, n := range names {
-		out = append(out, best[n].row)
+		out = append(out, best[n])
 	}
 	return out, nil
 }
