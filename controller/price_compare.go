@@ -6095,8 +6095,16 @@ func pcRunRefresh(force bool, sel []string) {
 func pcStartAutoRefresh() {
 	pcAutoOnce.Do(func() {
 		go func() {
+			tick := 0
 			for {
 				time.Sleep(60 * time.Second)
+				tick++
+				// 每 ~5 分钟后台重探逐 key 可见模型并重新发布 key 级路由注册表：
+				// 探测免费（/v1/models），持续新鲜让多 key 渠道始终按可见性选 key，
+				// 不因探测数据过期回退默认轮询、选中无权限的 key 直接 404
+				if tick%5 == 0 {
+					go pcRefreshAccessCache()
+				}
 				cfg := pcLoadPriority()
 				if cfg.RefreshInterval == "never" {
 					continue

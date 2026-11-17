@@ -220,10 +220,23 @@ func pcPublishKeyModelRoute() {
 	pcAccessMu.Lock()
 	acc, accAt, accKeys := pcAccessCache.data, pcAccessCache.at, pcAccessCache.keys
 	pcAccessMu.Unlock()
-	// 探测数据过期（与试测同样按 10 分钟计）视同缺失：宁空表回退默认轮询，不发布过时路由
+	// 探测数据过期（与试测同样按 10 分钟计）：key 集与探测快照一致时【保留现有
+	// 注册表、跳过发布】——上游分组白名单不常变，旧表大概率仍正确；发布空表会
+	// 让多 key 渠道回退默认轮询、选中看不见该模型的 key 直接 404（实测踩坑）。
+	// 仅当保险箱 key 集已变（下标可能错位）才发布空表回退默认轮询
 	if acc == nil || time.Since(accAt) >= 10*time.Minute {
-		service.SetKeyModelRoute(out)
-		return
+		if acc == nil {
+			service.SetKeyModelRoute(out)
+			return
+		}
+		kv := pcLoadKeys()
+		for _, kind := range []string{"openrouter", "opencode", "deepseek", "apib", "buzzai", "apikl", "ikun"} {
+			if !slices.Equal(pcKindVaultKeys(&kv, kind), accKeys[kind]) {
+				service.SetKeyModelRoute(out) // key 集变了：下标错位风险，回退默认轮询
+				return
+			}
+		}
+		return // key 集未变：保留现有注册表，等后台重探刷新
 	}
 	kv := pcLoadKeys()
 	for _, kind := range []string{"openrouter", "opencode", "deepseek", "apib", "buzzai", "apikl", "ikun"} {
