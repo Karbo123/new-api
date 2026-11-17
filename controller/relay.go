@@ -391,6 +391,12 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 	if types.IsChannelError(openaiErr) {
 		return true
 	}
+	if pcIsUpstreamPolicyReject(openaiErr) && retryTimes > 0 && !service.GetChannelConstraints(c).SuppressesRetry() {
+		// 上游池子（Claude Code OAuth 轮换）的内容策略拦截是概率性的：同一请求
+		// 在其他账号/渠道常能通过（用户实测随机复现）。视为渠道级拒绝走跨渠道
+		// 重试，而不是当确定性客户端错误直接终止
+		return true
+	}
 	if types.IsSkipRetryError(openaiErr) {
 		return false
 	}
@@ -428,6 +434,19 @@ func pcIsInsufficientBalance(err *types.NewAPIError) bool {
 		strings.Contains(msg, "insufficient_quota") ||
 		strings.Contains(msg, "余额不足") ||
 		strings.Contains(msg, "欠费")
+}
+
+// pcIsUpstreamPolicyReject 判定上游「内容策略」400 拦截（Anthropic AUP 分类器
+// 对 Claude Code 池子账号的拒绝文案）。该拦截是概率性误伤（同一请求换个账号/
+// 渠道常能通过），应触发跨渠道兜底而非按确定性客户端错误终止；真正违规的
+// 内容在所有渠道都会被拒，兜底不改变最终拦截结果
+func pcIsUpstreamPolicyReject(err *types.NewAPIError) bool {
+	if err == nil || err.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "usage policy") ||
+		strings.Contains(msg, "unable to respond to this request")
 }
 
 func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError, relayInfo *relaycommon.RelayInfo) {
