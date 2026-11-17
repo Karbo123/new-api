@@ -1167,6 +1167,18 @@ func pcFetchGoPayg() ([]pcGoModel, bool) {
 	if mdx == "" {
 		return nil, false
 	}
+	// ② console/go 页：每模型 Go 月限额（公开 HTML 内嵌）
+	html, err := pcHttpGet(pcGoConsoleURL, 30*time.Second, nil)
+	if err != nil {
+		return nil, false
+	}
+	return pcParseGoPayg(mdx, html)
+}
+
+// pcParseGoPayg 解析 models.mdx 的 PAYG 单价表与 console/go 页的 Go 月限额，
+// 合并产出 GoModels（单价=PAYG 原价、Limit=Go 月限额）。纯函数，与抓取解耦
+// 以便回归测试。bool=false=任一源解析为空
+func pcParseGoPayg(mdx, html string) ([]pcGoModel, bool) {
 	official := map[string]pcGoModel{} // lower 模型名 → PAYG 单价（$/M）
 	cell := func(l string) []string {
 		cs := strings.Split(strings.Trim(strings.TrimSpace(l), "|"), "|")
@@ -1211,11 +1223,6 @@ func pcFetchGoPayg() ([]pcGoModel, bool) {
 	if len(official) == 0 {
 		return nil, false
 	}
-	// ② console/go 页：模型名（title）→ Go 月限额（该模型段内首个 $ 金额）
-	html, err := pcHttpGet(pcGoConsoleURL, 30*time.Second, nil)
-	if err != nil {
-		return nil, false
-	}
 	limits := map[string]float64{} // lower console 展示名（含尾部标注）→ Go 限额
 	nameRe := regexp.MustCompile(`data-layer="model-name" title="([^"]+)"`)
 	amountRe := regexp.MustCompile(`\$([0-9][0-9,.]*)`)
@@ -1233,7 +1240,10 @@ func pcFetchGoPayg() ([]pcGoModel, bool) {
 		if perr != nil || v <= 0 {
 			continue
 		}
-		name := strings.TrimSpace(html[np[1]:np[3]])
+		// np[0]/np[1]=整个匹配的起止，np[2]/np[3]=title 分组的起止——
+		// 此前误用 html[np[1]:np[3]]（low>high）必然越界 panic，冷启动刷新
+		// 一跑到这里整个进程闪退
+		name := strings.TrimSpace(html[np[2]:np[3]])
 		limits[strings.ToLower(name)] = v
 	}
 	// ③ 合并：PAYG 模型名前缀匹配 console 段名（console 名常带尾部标注如
@@ -6050,10 +6060,24 @@ func pcRunRefresh(force bool, sel []string) {
 								}
 							}
 						}()
-						fn()
-						close(finished)
+						// fn 的 panic 在此收敛为单源 failed：此前 panic 会沿无 recover
+						// 的 goroutine 击穿整个进程（闪退，面板与渠道全部陪葬）
+						ok := func() (ok bool) {
+							defer func() {
+								if r := recover(); r != nil {
+									ok = false
+									common.SysError(fmt.Sprintf("price_compare refresh source %s panic: %v", name, r))
+									mu.Lock()
+									states[idxOf[name]] = pcStageItem{Name: name, Status: "failed", Note: "panic（已隔离，源实现缺陷待修）"}
+									mu.Unlock()
+								}
+								close(finished)
+							}()
+							fn()
+							return true
+						}()
 						if atomic.CompareAndSwapInt32(&fired[idxOf[name]], 0, 1) {
-							events <- srcEvent{name, true}
+							events <- srcEvent{name, ok}
 						}
 					}(t.name, t.fn)
 				}
