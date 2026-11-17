@@ -397,6 +397,11 @@ func shouldRetry(c *gin.Context, openaiErr *types.NewAPIError, retryTimes int) b
 		// 重试，而不是当确定性客户端错误直接终止
 		return true
 	}
+	if openaiErr.GetErrorCode() == types.ErrorCodeChannelNoAvailableKey && retryTimes > 0 && !service.GetChannelConstraints(c).SuppressesRetry() {
+		// 多 key 渠道全部 key 被禁（欠费拉黑等）：换下一候选渠道再试，而不是
+		// 把首选渠道的 key 状态直接当终态返回给调用方
+		return true
+	}
 	if types.IsSkipRetryError(openaiErr) {
 		return false
 	}
