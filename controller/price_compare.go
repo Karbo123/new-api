@@ -6194,6 +6194,12 @@ func pcLoadCacheOnce() {
 			// 后台完整刷新：抓源+补 OR 价+应用规则，完成后行情自动更新
 			pcRunRefresh(false, nil)
 		}()
+		go func() {
+			// 冷启动即重探逐 key 可见模型并发布 key 级路由注册表：注册表在内存、
+			// 重启即空，不重探则头几分钟多 key 渠道回退默认轮询、选中无权限的
+			// key 直接 404（实测踩坑）
+			pcRefreshAccessCache()
+		}()
 	})
 }
 
