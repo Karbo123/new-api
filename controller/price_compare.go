@@ -71,6 +71,16 @@ const pcGoMdxURL = "https://raw.githubusercontent.com/anomalyco/opencode/dev/" +
 const pcGoMdxURLMirror = "https://cdn.jsdelivr.net/gh/anomalyco/opencode@dev/" +
 	"services/site/src/docs/content/console/go.mdx"
 
+// 2026-11-17 文档改版：go.mdx 的每模型定价表（Model|Monthly limit|Input|Output）
+// 被移出，token 单价迁到 models.mdx（PAYG 表，Model|Input|Output|Cached Read|
+// Cached Write，静态仍在 GitHub）、每模型 Go 月限额迁到 console/go 页（公开
+// HTML 内嵌，sr-only 文本 "Go: $N" 可正则提取）
+const pcGoModelsMdxURL = "https://raw.githubusercontent.com/anomalyco/opencode/dev/" +
+	"services/site/src/docs/content/console/models.mdx"
+const pcGoModelsMdxURLMirror = "https://cdn.jsdelivr.net/gh/anomalyco/opencode@dev/" +
+	"services/site/src/docs/content/console/models.mdx"
+const pcGoConsoleURL = "https://opencode.ai/console/go"
+
 var pcDeepseekURLs = []string{
 	"https://api-docs.deepseek.com/zh-cn/quick_start/pricing/",
 	"https://api-docs.deepseek.com/quick_start/pricing/",
@@ -1093,6 +1103,34 @@ func pcFetchGoModels(force bool) {
 		return
 	}
 	pcMu.Unlock()
+	// 主源（2026-11-17 文档改版后）：models.mdx 的 PAYG 单价表 + console/go 页的
+	// 每模型 Go 月限额（详见 pcFetchGoPayg）。失败兜底走旧 go.mdx 定价表解析
+	// （表已迁出，解析会失败并保旧缓存，但保留以兼容回滚/站方撤回改版）
+	if rows, ok := pcFetchGoPayg(); ok && len(rows) > 0 {
+		// 在线目录过滤：文档会残留已下线模型（如 mimo-v2.5/-pro 仍在定价表，/v1/models
+		// 已无），下线 ref 不再进行情与管理渠道 models。PAYG 表缺 free 档时保留旧档
+		liveIds := pcFetchGoLiveIds()
+		pcMu.Lock()
+		old := pcCache.GoModels
+		pcMu.Unlock()
+		byId := map[string]int{}
+		for i := range rows {
+			byId[rows[i].ModelId] = i
+		}
+		for _, o := range old {
+			if _, ok := byId[o.ModelId]; !ok && (len(liveIds) == 0 || liveIds[o.ModelId]) {
+				rows = append(rows, o) // 新表未覆盖（free 档等）且仍在线：保留旧条目
+			}
+		}
+		if len(liveIds) > 0 {
+			rows = slices.DeleteFunc(rows, func(r pcGoModel) bool { return !liveIds[r.ModelId] })
+		}
+		pcMu.Lock()
+		pcCache.GoModels = rows
+		pcCache.GoAt = time.Now().Unix()
+		pcMu.Unlock()
+		return
+	}
 	// 双源兜底；正文必须含定价表头才算拿到（防止 404 页被当文档解析）。
 	// 新文档表头为英文 Monthly limit，旧中文「每月限制」保留兼容
 	body := ""
@@ -1109,6 +1147,112 @@ func pcFetchGoModels(force bool) {
 	// 在线目录过滤：文档会残留已下线模型（如 mimo-v2.5/-pro 仍在定价表，/v1/models
 	// 已无），下线 ref 不再进行情与管理渠道 models
 	pcParseGoMdx(body, pcFetchGoLiveIds())
+}
+
+// pcFetchGoPayg 新主源（2026-11-17 文档改版后）：①models.mdx 的 PAYG 单价表
+// （Model|Input|Output|Cached Read|Cached Write，per 1M，官方 PAYG 口径——比 Go
+// 空闲折扣价保守/不低估）；②console/go 页公开 HTML 的每模型 Go 月限额
+// （data-plan="go" 段内首个 $ 金额）。产出 GoModels：单价=PAYG 原价、
+// Limit=Go 月限额，订阅折扣 ×(10/限额) 由行倍率承载（unified 构建不变）。
+// bool=false=两源任一失败（调用方保旧缓存）
+func pcFetchGoPayg() ([]pcGoModel, bool) {
+	// ① models.mdx：PAYG 单价表（Model|Input|Output|Cached Read|Cached Write）
+	mdx := ""
+	for _, u := range []string{pcGoModelsMdxURL, pcGoModelsMdxURLMirror} {
+		if b, err := pcHttpGet(u, 25*time.Second, nil); err == nil && strings.Contains(b, "Cached Read") {
+			mdx = b
+			break
+		}
+	}
+	if mdx == "" {
+		return nil, false
+	}
+	official := map[string]pcGoModel{} // lower 模型名 → PAYG 单价（$/M）
+	cell := func(l string) []string {
+		cs := strings.Split(strings.Trim(strings.TrimSpace(l), "|"), "|")
+		for i := range cs {
+			cs[i] = strings.TrimSpace(cs[i])
+		}
+		return cs
+	}
+	defv := func(s string) float64 {
+		if f := pcParsePrice(s); f != nil {
+			return *f
+		}
+		return 0
+	}
+	tableRe := regexp.MustCompile(`(?m)^[ \t]*\|[^\n]+\|(?:\n[ \t]*\|[^\n]+\|)*`)
+	for _, tbl := range tableRe.FindAllString(mdx, -1) {
+		lines := strings.Split(tbl, "\n")
+		head := cell(lines[0])
+		if len(head) < 5 || head[0] != "Model" || head[1] != "Input" || head[2] != "Output" || head[3] != "Cached Read" {
+			continue // 只取 PAYG 定价表（其余为 ID/说明表）
+		}
+		for _, l := range lines[2:] {
+			cs := cell(l)
+			if len(cs) < 5 || cs[0] == "" {
+				continue
+			}
+			in := pcParsePrice(cs[1])
+			out := pcParsePrice(cs[2])
+			if in == nil || out == nil {
+				continue
+			}
+			row := pcGoModel{
+				Name: cs[0], Input: *in, Output: *out,
+				CacheRead: defv(cs[3]),
+			}
+			if cw := pcParsePrice(cs[4]); cw != nil {
+				row.CacheWrite = cw
+			}
+			official[strings.ToLower(cs[0])] = row
+		}
+	}
+	if len(official) == 0 {
+		return nil, false
+	}
+	// ② console/go 页：模型名（title）→ Go 月限额（该模型段内首个 $ 金额）
+	html, err := pcHttpGet(pcGoConsoleURL, 30*time.Second, nil)
+	if err != nil {
+		return nil, false
+	}
+	limits := map[string]float64{} // lower console 展示名（含尾部标注）→ Go 限额
+	nameRe := regexp.MustCompile(`data-layer="model-name" title="([^"]+)"`)
+	amountRe := regexp.MustCompile(`\$([0-9][0-9,.]*)`)
+	namePos := nameRe.FindAllStringSubmatchIndex(html, -1)
+	for i, np := range namePos {
+		end := len(html)
+		if i+1 < len(namePos) {
+			end = namePos[i+1][0]
+		}
+		am := amountRe.FindStringSubmatch(html[np[0]:end])
+		if am == nil {
+			continue
+		}
+		v, perr := strconv.ParseFloat(strings.ReplaceAll(am[1], ",", ""), 64)
+		if perr != nil || v <= 0 {
+			continue
+		}
+		name := strings.TrimSpace(html[np[1]:np[3]])
+		limits[strings.ToLower(name)] = v
+	}
+	// ③ 合并：PAYG 模型名前缀匹配 console 段名（console 名常带尾部标注如
+	// " 1017"，取最长匹配者的限额）；无匹配（free 档不进 PAYG 表）由调用方
+	// 用旧条目补缺
+	rows := make([]pcGoModel, 0, len(official))
+	for lowerName, off := range official {
+		lim, bestLen := 0.0, -1
+		for cName, v := range limits {
+			if strings.HasPrefix(cName, lowerName) && len(cName) > bestLen {
+				bestLen, lim = len(cName), v
+			}
+		}
+		r := off
+		r.Limit = lim
+		rows = append(rows, r)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
+	return rows, len(rows) > 0
 }
 
 // pcParseGoMdx 解析 go.mdx 正文：定价表（PlanTabs 第一张即 Go 档）+ 模型 ID 表，
