@@ -172,6 +172,8 @@ func Distribute() func(c *gin.Context) {
 							showGroup = fmt.Sprintf("auto(%s)", selectGroup)
 						}
 						message := i18n.T(c, i18n.MsgDistributorGetChannelFailed, map[string]any{"Group": showGroup, "Model": modelRequest.Model, "Error": err.Error()})
+						// 静默 503 排障代价高（响应无日志时无从定位），此处必留痕
+						logger.LogError(c, fmt.Sprintf("distributor: get channel failed (group=%s model=%s): %s", showGroup, modelRequest.Model, err.Error()))
 						// 如果错误，但是渠道不为空，说明是数据库一致性问题
 						//if channel != nil {
 						//	common.SysError(fmt.Sprintf("渠道不存在：%d", channel.Id))
@@ -181,6 +183,7 @@ func Distribute() func(c *gin.Context) {
 						return
 					}
 					if channel == nil {
+						logger.LogError(c, fmt.Sprintf("distributor: no available channel (group=%s model=%s)", usingGroup, modelRequest.Model))
 						abortWithOpenAiMessage(c, http.StatusServiceUnavailable, i18n.T(c, i18n.MsgDistributorNoAvailableChannel, map[string]any{"Group": usingGroup, "Model": modelRequest.Model}), types.ErrorCodeModelNotFound)
 						return
 					}

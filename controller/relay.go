@@ -94,6 +94,18 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	defer func() {
 		if newAPIError != nil {
 			logger.LogError(c, fmt.Sprintf("relay error: %s", common.LocalLogPreview(newAPIError.Error())))
+			// 转售池「分组暂无账号」的 404：改写为 503 + 非 model_not_found 代码再出站。
+			// 上游原样透传会让 ZCode 等客户端把 provider_code=model_not_found 解读为
+			// 「模型已下线」，直接把模型从可选列表踢掉（用户实测截图）；池子账号是
+			// 分钟级自愈的，正确语义是「暂时不可用，请重试」
+			if pcIsPoolModelAbsent(newAPIError) {
+				logger.LogError(c, "relay error rewritten: pool model absent -> 503 upstream_pool_unavailable (retryable)")
+				newAPIError = types.NewErrorWithStatusCode(
+					errors.New("upstream pool temporarily has no available account for this model (auto-recovers in minutes), please retry"),
+					types.ErrorCode("upstream_pool_unavailable"),
+					http.StatusServiceUnavailable,
+				)
+			}
 			newAPIError.SetMessage(common.MessageWithRequestId(newAPIError.Error(), requestId))
 			switch relayFormat {
 			case types.RelayFormatOpenAIRealtime:
