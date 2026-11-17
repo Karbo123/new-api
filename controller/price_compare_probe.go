@@ -42,8 +42,13 @@ type pcProbeKeyResult struct {
 	Ok     bool     `json:"ok"`
 	Count  int      `json:"count,omitempty"`
 	Models []string `json:"models,omitempty"`
-	Error  string   `json:"error,omitempty"`
-	Detail string   `json:"detail,omitempty"`
+	// Rate sub2api 系（apikl/ikun）该 key 的实际结算倍率（/v1/sub2api/billing
+	// 的 effective_rate_multiplier，探测时顺带拉取，免费）。站点模型广场展示的
+	// 挂牌倍率可能与实际结算不一致（ikun CC 组挂牌 ×0.35 实结 ×0.45），真实
+	// 计费以结算倍率为准。0 = 未知（端点失败/非 sub2api 渠道）
+	Rate   float64 `json:"rate,omitempty"`
+	Error  string  `json:"error,omitempty"`
+	Detail string  `json:"detail,omitempty"`
 }
 
 type pcProbeKindResult struct {
@@ -98,6 +103,35 @@ func pcProbeTarget(kind string) (string, map[string]string) {
 		headers["x-opencode-session"] = pcOpencodeSession()
 	}
 	return base, headers
+}
+
+// pcSub2apiKeyRate sub2api 系（apikl/ikun）逐 key 实际结算倍率：GET /v1/sub2api/billing
+// 免费（key 鉴权），effective_rate_multiplier 是真实计费口径——站点模型广场的挂牌
+// 分组倍率可能与实际结算不一致（ikun CC 组挂牌 ×0.35 实结 ×0.45，用户后台对账发现）
+func pcSub2apiKeyRate(base, key string) float64 {
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(base, "/")+"/v1/sub2api/billing", nil)
+	if err != nil {
+		return 0
+	}
+	req.Header.Set("Authorization", "Bearer "+key)
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<10))
+	var out struct {
+		EffectiveRateMultiplier float64 `json:"effective_rate_multiplier"`
+		GroupRateMultiplier     float64 `json:"group_rate_multiplier"`
+	}
+	if json.Unmarshal(raw, &out) != nil {
+		return 0
+	}
+	if out.EffectiveRateMultiplier > 0 {
+		return out.EffectiveRateMultiplier
+	}
+	return out.GroupRateMultiplier
 }
 
 // pcProbeModels 用一把 key 调上游 /v1/models，返回该 key 可见的模型 id 列表
@@ -189,7 +223,13 @@ func pcRefreshAccessCache() {
 					res.Keys = append(res.Keys, pcProbeKeyResult{Key: pcMaskKey(k), Ok: false, Error: errCode, Detail: detail})
 					continue
 				}
-				res.Keys = append(res.Keys, pcProbeKeyResult{Key: pcMaskKey(k), Ok: true, Count: len(models), Models: models})
+				pr := pcProbeKeyResult{Key: pcMaskKey(k), Ok: true, Count: len(models), Models: models}
+				// sub2api 系顺带拉该 key 的实际结算倍率（免费端点）：站点广场挂牌
+				// 倍率可能与实际结算不一致，真实计费以结算倍率为准
+				if kind == "apikl" || kind == "ikun" {
+					pr.Rate = pcSub2apiKeyRate(base, k)
+				}
+				res.Keys = append(res.Keys, pr)
 			}
 			mu.Lock()
 			out[kind] = res
