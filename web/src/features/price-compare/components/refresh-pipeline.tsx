@@ -123,7 +123,7 @@ function StageNode({
         {stageIcon(stage.status, index)}
       </div>
       <span
-        className='text-foreground line-clamp-2 text-center text-xs leading-tight font-medium'
+        className='text-foreground line-clamp-2 min-h-[2.5em] text-center text-xs leading-tight font-medium'
         title={label}
       >
         {label}

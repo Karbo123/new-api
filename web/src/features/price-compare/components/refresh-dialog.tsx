@@ -147,48 +147,43 @@ export function RefreshDialog({
           pc.refreshStatus && <RefreshPipelineCard status={pc.refreshStatus} />
         )}
 
-        <DialogFooter className='items-center gap-2'>
-          {view === 'select' && (
-            <>
-              <Button
-                variant='ghost'
-                size='sm'
-                className='mr-auto'
-                disabled={selected.length === allKeys.length}
-                onClick={() => setSelected(allKeys)}
-              >
-                {t('Select all')}
-              </Button>
-              <Button variant='outline' onClick={() => onOpenChange(false)}>
-                {t('Cancel')}
-              </Button>
-              <Button onClick={start} disabled={selected.length === 0}>
-                {t('Start refresh')} ({selected.length}/{allKeys.length})
-              </Button>
-            </>
-          )}
-          {view === 'progress' && (
-            <Button
-              variant='outline'
-              className='ml-auto'
-              onClick={() => onOpenChange(false)}
-            >
-              {t('Hide')}
-            </Button>
-          )}
-          {view === 'result' && (
-            <>
-              <Button
-                variant='outline'
-                className='mr-auto'
-                onClick={() => setShowResult(false)}
-              >
-                {t('Start a new refresh')}
-              </Button>
-              <Button onClick={() => onOpenChange(false)}>{t('Close')}</Button>
-            </>
-          )}
-        </DialogFooter>
+        {/* progress 视图不渲染 footer：唯一动作（隐藏）与右上 X 重复，且整条
+            footer 带会在进度卡片下方留一大块空，观感差。隐藏动作由右上 X 承担 */}
+        {view !== 'progress' && (
+          <DialogFooter className='items-center gap-2'>
+            {view === 'select' && (
+              <>
+                <Button
+                  variant='ghost'
+                  size='sm'
+                  className='mr-auto'
+                  disabled={selected.length === allKeys.length}
+                  onClick={() => setSelected(allKeys)}
+                >
+                  {t('Select all')}
+                </Button>
+                <Button variant='outline' onClick={() => onOpenChange(false)}>
+                  {t('Cancel')}
+                </Button>
+                <Button onClick={start} disabled={selected.length === 0}>
+                  {t('Start refresh')} ({selected.length}/{allKeys.length})
+                </Button>
+              </>
+            )}
+            {view === 'result' && (
+              <>
+                <Button
+                  variant='outline'
+                  className='mr-auto'
+                  onClick={() => setShowResult(false)}
+                >
+                  {t('Start a new refresh')}
+                </Button>
+                <Button onClick={() => onOpenChange(false)}>{t('Close')}</Button>
+              </>
+            )}
+          </DialogFooter>
+        )}
       </DialogContent>
     </Dialog>
   )
