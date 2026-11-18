@@ -280,6 +280,16 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		if !shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry()) {
 			break
 		}
+		// 转售池「分组暂无账号」404：池子账号分钟级浮动（实测 01:13-01:18 六连败
+		// 后 1 分钟自愈）。连续重试间隔过短会整段落进掉线窗口全败——按 3s/6s/12s
+		// 退避拉开重试间隔，覆盖约半分钟的池子自愈窗口，对客户端透明
+		if pcIsPoolModelAbsent(newAPIError) {
+			backoff := time.Duration(3*(1<<min(common.RetryTimes-retryParam.GetRetry(), 2))) * time.Second
+			if backoff > 15*time.Second {
+				backoff = 15 * time.Second
+			}
+			time.Sleep(backoff)
+		}
 	}
 
 	useChannel := c.GetStringSlice("use_channel")
