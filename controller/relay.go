@@ -223,8 +223,11 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 			break
 		}
 		// 池子熔断中的渠道直接绕行：连续「分组暂无账号」达阈值后临时跳过，
-		// 不再让客户端的重连轮次浪费在必败请求上（到期自动半开放行试探）
-		if pcPoolCircuitTripped(channel.Id) {
+		// 不再让客户端的重连轮次浪费在必败请求上（到期自动半开放行试探）。
+		// 记录 wasTripped：走到的执行若是半开试探（熔断到期后最后一轮放行），
+		// 试探仍遇池子无账号就立刻续熔断，不再整链退避重试（长空窗防护）
+		pcWasTripped := pcPoolCircuitTripped(channel.Id)
+		if pcWasTripped {
 			if retryParam.GetRetry() < common.RetryTimes {
 				continue // 换下一候选渠道
 			}
@@ -286,6 +289,12 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		relayInfo.LastError = newAPIError
 
 		processChannelError(c, *types.NewChannelError(channel.Id, channel.Type, channel.Name, channel.ChannelInfo.IsMultiKey, common.GetContextKeyString(c, constant.ContextKeyChannelKey), channel.GetAutoBan()), newAPIError, relayInfo)
+
+		// 半开试探仍无账号：续熔断并立即终止重试链（长空窗防护，见 pcWasTripped）
+		if pcWasTripped && (pcIsPoolModelAbsent(newAPIError) || pcIsPoolExhausted(newAPIError)) {
+			pcPoolCircuitReopen(channel.Id)
+			break
+		}
 
 		if !shouldRetry(c, newAPIError, common.RetryTimes-retryParam.GetRetry()) {
 			break
@@ -654,6 +663,17 @@ func pcPoolCircuitTripped(channelID int) bool {
 		return false
 	}
 	return true
+}
+
+// pcPoolCircuitReopen 半开试探失败后续熔断：长空窗（上游整组账号耗尽数十分钟）
+// 期间，每次试探若失败不应整链重试（7 次尝试+退避约 90s，客户端早超时、上游
+// 被白打）——直接续上熔断窗口，客户端秒级拿到可重试 503，下个窗口再试探
+func pcPoolCircuitReopen(channelID int) {
+	pcPoolCircuitMu.Lock()
+	defer pcPoolCircuitMu.Unlock()
+	pcPoolCircuitUntil[channelID] = common.GetTimestamp() + pcPoolCircuitSeconds
+	delete(pcPoolCircuitStreak, channelID)
+	common.SysLog(fmt.Sprintf("price_compare pool circuit REOPEN: channel #%d 半开试探仍无可用账号，续熔断 %ds", channelID, pcPoolCircuitSeconds))
 }
 
 func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError, relayInfo *relaycommon.RelayInfo) {
