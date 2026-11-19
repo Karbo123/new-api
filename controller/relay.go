@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/QuantumNous/new-api/common"
@@ -218,6 +219,13 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 				continue // post 语句自动推进重试序号，下一轮候选渠道
 			}
 			break
+		}
+		// 池子熔断中的渠道直接绕行：连续「分组暂无账号」达阈值后临时跳过，
+		// 不再让客户端的重连轮次浪费在必败请求上（到期自动半开放行试探）
+		if pcPoolCircuitTripped(channel.Id) {
+			if retryParam.GetRetry() < common.RetryTimes {
+				continue // 换下一候选渠道
+			}
 		}
 		addUsedChannel(c, channel.Id)
 		if billingErr := service.PrepareTieredBillingForSelectedGroup(c, relayInfo); billingErr != nil {
@@ -500,8 +508,72 @@ func pcIsPoolModelAbsent(err *types.NewAPIError) bool {
 		strings.Contains(msg, "not supported by any configured account")
 }
 
+// pcIsPoolExhausted 转售池「全部账号耗尽/不可用」（403/502/404 多形态文案）——
+// 与 pcIsPoolModelAbsent 同为池子无账号语义，一并计入熔断计数
+func pcIsPoolExhausted(err *types.NewAPIError) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "all available accounts exhausted")
+}
+
+// ---- 转售池「分组暂无账号」熔断：连续失败达阈值后临时跳过该渠道 ----
+// 上游池子按缓存亲和把同会话绑定到特定账号，账号额度耗尽时该渠道每次必败
+// （用户实测一个 ZCode session 稳定失败、另一个正常——正是绑到了不同账号）。
+// 连续 N 次池子无账号后熔断该渠道 2 分钟：请求直接绕行备用渠道，不再每次先
+// 撞死池子浪费客户端重连轮次；到期自动半开放行试探，池子恢复即自愈
+var pcPoolCircuitMu sync.Mutex
+var pcPoolCircuitStreak = map[int]int{}
+var pcPoolCircuitUntil = map[int]int64{}
+
+const (
+	pcPoolCircuitThreshold = 5   // 连续失败阈值
+	pcPoolCircuitSeconds   = 120 // 熔断时长
+)
+
+func pcPoolCircuitMark(channelID int) {
+	pcPoolCircuitMu.Lock()
+	defer pcPoolCircuitMu.Unlock()
+	pcPoolCircuitStreak[channelID]++
+	if pcPoolCircuitStreak[channelID] >= pcPoolCircuitThreshold {
+		pcPoolCircuitUntil[channelID] = common.GetTimestamp() + pcPoolCircuitSeconds
+		delete(pcPoolCircuitStreak, channelID)
+		common.SysLog(fmt.Sprintf("price_compare pool circuit OPEN: channel #%d 连续 %d 次「无可用账号」，熔断 %ds（到期半开试探）",
+			channelID, pcPoolCircuitThreshold, pcPoolCircuitSeconds))
+	}
+}
+
+func pcPoolCircuitClear(channelID int) {
+	pcPoolCircuitMu.Lock()
+	defer pcPoolCircuitMu.Unlock()
+	delete(pcPoolCircuitStreak, channelID)
+}
+
+// pcPoolCircuitTripped 渠道是否处于池子熔断中（到期自动半开放行试探）
+func pcPoolCircuitTripped(channelID int) bool {
+	pcPoolCircuitMu.Lock()
+	defer pcPoolCircuitMu.Unlock()
+	until, ok := pcPoolCircuitUntil[channelID]
+	if !ok {
+		return false
+	}
+	if common.GetTimestamp() >= until {
+		delete(pcPoolCircuitUntil, channelID)
+		return false
+	}
+	return true
+}
+
 func processChannelError(c *gin.Context, channelError types.ChannelError, err *types.NewAPIError, relayInfo *relaycommon.RelayInfo) {
 	logger.LogError(c, fmt.Sprintf("channel error (channel #%d, status code: %d): %s", channelError.ChannelId, err.StatusCode, common.LocalLogPreview(err.Error())))
+	// 池子熔断计数：连续「分组暂无账号」达阈值 → 渠道临时熔断（见
+	// pcPoolCircuit* 状态）；其他类型的错误说明渠道/池子仍有响应，清零重来
+	if pcIsPoolModelAbsent(err) || pcIsPoolExhausted(err) {
+		pcPoolCircuitMark(channelError.ChannelId)
+	} else {
+		pcPoolCircuitClear(channelError.ChannelId)
+	}
 	// 欠费按 key 精准停用（多 key 渠道）：把出错的那把 key 标记停用，后续请求选 key
 	// 自动跳过它改用有钱的 key；全部 key 停用时 handlerMultiKeyUpdate 会把渠道一并
 	// 自动停用。充值后可在面板多 key 管理里重新启用该 key。
