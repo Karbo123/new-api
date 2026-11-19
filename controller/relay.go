@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"encoding/json"
+
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/constant"
 	taskdto "github.com/QuantumNous/new-api/dto"
@@ -290,13 +292,18 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		}
 		// 转售池「分组暂无账号」404：池子账号分钟级浮动（实测 01:13-01:18 六连败
 		// 后 1 分钟自愈）。连续重试间隔过短会整段落进掉线窗口全败——按 3s/6s/12s
-		// 退避拉开重试间隔，覆盖约半分钟的池子自愈窗口，对客户端透明
+		// 退避拉开重试间隔，覆盖约半分钟的池子自愈窗口，对客户端透明。
+		// 同时注入零宽字符扰动打破上游「缓存亲和」账号粘性：池子按上下文前缀把
+		// 同会话绑定到特定账号，账号耗尽时同前缀请求永远 404——重试轮次往
+		// instructions 末尾追加递增零宽字符改变内容指纹，强制上游重新调度账号。
+		// 零宽字符不改变语义（模型输出不受影响），前缀错位仅使该请求缓存 miss
 		if pcIsPoolModelAbsent(newAPIError) {
 			backoff := time.Duration(3*(1<<min(common.RetryTimes-retryParam.GetRetry(), 2))) * time.Second
 			if backoff > 15*time.Second {
 				backoff = 15 * time.Second
 			}
 			time.Sleep(backoff)
+			pcPerturbPrefixForStickyPool(c, retryParam.GetRetry())
 		}
 	}
 
@@ -506,6 +513,37 @@ func pcIsPoolModelAbsent(err *types.NewAPIError) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "not available for this group") ||
 		strings.Contains(msg, "not supported by any configured account")
+}
+
+// pcPerturbPrefixForStickyPool 池子 404 重试时的前缀扰动：往 /v1/responses
+// 请求的 instructions（system 位）末尾追加 n 个零宽字符（U+200B）。上游 cursor
+// 池按上下文前缀做缓存亲和把同会话绑定到特定账号，账号耗尽时同前缀请求永远
+// 404——零宽字符改变内容指纹强制上游重新调度账号，且不改变语义（模型输出
+// 不受影响）、不破坏已有缓存（错位点在末尾）。解析失败时保留原请求体
+func pcPerturbPrefixForStickyPool(c *gin.Context, n int) {
+	storage, err := common.GetBodyStorage(c)
+	if err != nil {
+		return
+	}
+	var body map[string]any
+	if err := common.DecodeJson(storage, &body); err != nil {
+		return
+	}
+	pad := strings.Repeat("\u200b", n)
+	if instr, ok := body["instructions"].(string); ok {
+		body["instructions"] = instr + pad
+	} else {
+		body["instructions"] = pad
+	}
+	if b, err := json.Marshal(body); err == nil {
+		if newStorage, err := common.CreateBodyStorage(b); err == nil {
+			old := storage
+			c.Set(common.KeyBodyStorage, newStorage)
+			c.Request.Body = io.NopCloser(newStorage)
+			_ = old
+			storage.Close()
+		}
+	}
 }
 
 // pcIsPoolExhausted 转售池「全部账号耗尽/不可用」（403/502/404 多形态文案）——
