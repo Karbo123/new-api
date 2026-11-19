@@ -207,6 +207,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 	}
 	relayInfo.RetryIndex = 0
 	relayInfo.LastError = nil
+	pcPoolAbsentInChain := 0 // 链内连续「池子无账号」次数（3 次封顶，见循环内）
 
 	for ; retryParam.GetRetry() <= common.RetryTimes; retryParam.IncreaseRetry() {
 		relayInfo.RetryIndex = retryParam.GetRetry()
@@ -306,13 +307,23 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 		// 同会话绑定到特定账号，账号耗尽时同前缀请求永远 404——重试轮次往
 		// instructions 末尾追加递增零宽字符改变内容指纹，强制上游重新调度账号。
 		// 零宽字符不改变语义（模型输出不受影响），前缀错位仅使该请求缓存 miss
-		if pcIsPoolModelAbsent(newAPIError) {
+		// 链内上限 3 次：第 1 次原始前缀（可能粘死耗尽账号）、第 2/3 次扰动改绑
+		// （尾部/头尾双层指纹）——再往下只有「分组级空窗」一种可能，上游停顿时
+		// 每次尝试要 30s+，跑满全链会白耗数分钟；熔断计数已由 processChannelError
+		// 累加，直接终止链路返回可重试 503
+		if pcIsPoolModelAbsent(newAPIError) || pcIsPoolExhausted(newAPIError) {
+			pcPoolAbsentInChain++
+			if pcPoolAbsentInChain >= 3 {
+				break
+			}
 			backoff := time.Duration(3*(1<<min(common.RetryTimes-retryParam.GetRetry(), 2))) * time.Second
 			if backoff > 15*time.Second {
 				backoff = 15 * time.Second
 			}
 			time.Sleep(backoff)
 			pcPerturbPrefixForStickyPool(c, relayInfo, retryParam.GetRetry())
+		} else {
+			pcPoolAbsentInChain = 0 // 其它错误类型：恢复完整重试预算
 		}
 	}
 
