@@ -414,6 +414,18 @@ func pcTestRateLimited(r pcTestOfferResult) bool {
 		strings.Contains(e, "too many requests")
 }
 
+// pcTestPoolNoAccount 转售池「分组暂无账号/全部账号耗尽」（404/403 多形态文案）：
+// 池子账号分钟级浮动，此刻失败稍后即恢复（用户实测多次）。与限流同性质——是
+// 池子的瞬时状态而非报价死亡；若据此判死会把 fable/opus 等从渠道 models 反复
+// 摘除（ZCode 模型列表随之消失，用户侧表现为「模型已不可用」），只视为「不定」：
+// 不标记、不剔除，下轮实测自然跟进
+func pcTestPoolNoAccount(r pcTestOfferResult) bool {
+	e := strings.ToLower(r.Error)
+	return strings.Contains(e, "not available for this group") ||
+		strings.Contains(e, "not supported by any configured account") ||
+		strings.Contains(e, "all available accounts exhausted")
+}
+
 // pcKindVaultKeys 按 kind 取保险箱里该渠道的 key 列表
 func pcKindVaultKeys(kv *pcKeyVault, kind string) []string {
 	for _, kk := range pcKeyKinds {

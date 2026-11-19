@@ -938,11 +938,15 @@ func testChannelForHealthCheck(ctx context.Context, channel *model.Channel, test
 
 	shouldBanChannel := false
 	newAPIError := result.newAPIError
+	// 转售池「无可用账号」是池子账号分钟级浮动，不是渠道凭证失效：定时健康检查
+	// 撞上无账号窗口时不得禁用渠道（否则渠道被拉黑、真实流量全面失败，直到下次
+	// 测试/刷新碰巧恢复）——交给 relay 的池子熔断器自愈即可
+	isPoolNoAccount := pcIsPoolModelAbsent(newAPIError) || pcIsPoolExhausted(newAPIError)
 	if newAPIError != nil {
-		shouldBanChannel = service.ShouldDisableChannel(result.newAPIError)
+		shouldBanChannel = service.ShouldDisableChannel(result.newAPIError) && !isPoolNoAccount
 	}
 
-	if common.AutomaticDisableChannelEnabled && !shouldBanChannel {
+	if common.AutomaticDisableChannelEnabled && !shouldBanChannel && !isPoolNoAccount {
 		if milliseconds > disableThreshold {
 			err := fmt.Errorf("响应时间 %.2fs 超过阈值 %.2fs", float64(milliseconds)/1000.0, float64(disableThreshold)/1000.0)
 			newAPIError = types.NewOpenAIError(err, types.ErrorCodeChannelResponseTimeExceeded, http.StatusRequestTimeout)

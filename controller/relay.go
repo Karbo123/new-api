@@ -303,7 +303,7 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 				backoff = 15 * time.Second
 			}
 			time.Sleep(backoff)
-			pcPerturbPrefixForStickyPool(c, retryParam.GetRetry())
+			pcPerturbPrefixForStickyPool(c, relayInfo, retryParam.GetRetry())
 		}
 	}
 
@@ -503,11 +503,13 @@ func pcIsUpstreamPolicyReject(err *types.NewAPIError) bool {
 		strings.Contains(msg, "unable to respond to this request")
 }
 
-// pcIsPoolModelAbsent 转售池「分组暂无账号」404：池子账号分钟级浮动，同一模型
+// pcIsPoolModelAbsent 转售池「分组暂无账号」：池子账号分钟级浮动，同一模型
 // 此刻 404 稍后即恢复（用户实测）。与"模型真的不存在"区分：后者文案是
-// not_found/does not exist 且跨渠道稳定复现
+// not_found/does not exist 且跨渠道稳定复现。不限状态码——同一文案实测有
+// 404/403/500 多种外壳，非 404 形态同样必须走池子语义（重试/熔断/禁禁用），
+// 否则 500 形态会绕过全部池子逻辑还触发渠道自动禁用
 func pcIsPoolModelAbsent(err *types.NewAPIError) bool {
-	if err == nil || err.StatusCode != http.StatusNotFound {
+	if err == nil {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
@@ -515,18 +517,71 @@ func pcIsPoolModelAbsent(err *types.NewAPIError) bool {
 		strings.Contains(msg, "not supported by any configured account")
 }
 
-// pcPerturbPrefixForStickyPool 池子 404 重试时的前缀扰动：往 /v1/responses
-// 请求的 instructions（system 位）末尾追加 n 个零宽字符（U+200B）。上游 cursor
-// 池按上下文前缀做缓存亲和把同会话绑定到特定账号，账号耗尽时同前缀请求永远
-// 404——零宽字符改变内容指纹强制上游重新调度账号，且不改变语义（模型输出
-// 不受影响）、不破坏已有缓存（错位点在末尾）。解析失败时保留原请求体
-func pcPerturbPrefixForStickyPool(c *gin.Context, n int) {
+// pcPerturbPrefixForStickyPool 池子 404 重试时的前缀扰动：往 system/instructions
+// 尾部追加 n 个零宽字符（U+200B）。上游 cursor 池按上下文前缀做缓存亲和把同
+// 会话绑定到特定账号，账号耗尽时同前缀请求永远 404——零宽字符改变内容指纹
+// 强制上游重新调度账号，且不改变语义（模型输出不受影响）、尾部错位不破坏已有
+// 缓存前缀。n≥2 时头部也加（任何只取短前缀的指纹算法都会命中变化）。
+// 关键：必须改解析后的请求结构体——relay 各 Helper 用 info.Request 结构体组装
+// 上游请求（ClaudeHelper 首行 DeepCopy(info.Request)，从不重读原始 body），
+// 只改 body storage 上游根本收不到扰动，等于白扰
+func pcPerturbPrefixForStickyPool(c *gin.Context, info *relaycommon.RelayInfo, n int) {
+	if info == nil || info.Request == nil || n <= 0 {
+		return
+	}
+	tail := strings.Repeat("\u200b", n)
+	head := ""
+	if n >= 2 {
+		head = strings.Repeat("\u200b", n-1)
+	}
+	switch req := info.Request.(type) {
+	case *dto.ClaudeRequest:
+		// Claude /v1/messages：ZCode 对 claude 系模型的主流量
+		switch sys := req.System.(type) {
+		case string:
+			req.System = head + sys + tail
+		case []dto.ClaudeMediaMessage:
+			block := dto.ClaudeMediaMessage{Type: dto.ContentTypeText}
+			block.SetText(tail)
+			sys = append(sys, block)
+			if head != "" {
+				headBlock := dto.ClaudeMediaMessage{Type: dto.ContentTypeText}
+				headBlock.SetText(head)
+				sys = append([]dto.ClaudeMediaMessage{headBlock}, sys...)
+			}
+			req.System = sys
+		case nil:
+			req.System = tail
+		}
+	case *dto.GeneralOpenAIRequest:
+		// chat completions：追加到首条消息内容（通常为 system）
+		if len(req.Messages) > 0 {
+			msg := &req.Messages[0]
+			switch ct := msg.Content.(type) {
+			case string:
+				msg.Content = head + ct + tail
+			case []dto.MediaContent:
+				msg.Content = append(ct, dto.MediaContent{Type: dto.ContentTypeText, Text: tail + head})
+			case nil:
+				msg.Content = tail
+			}
+		}
+	default:
+		// 其它入站格式（如 /v1/responses 直入）退回原始 body instructions 兜底：
+		// 若该 Helper 恰好重读 body 则生效，否则无害
+		pcPerturbRawBodyInstructions(c, n)
+	}
+}
+
+// pcPerturbRawBodyInstructions 原始 body 的 instructions 字段兜底扰动
+func pcPerturbRawBodyInstructions(c *gin.Context, n int) {
 	storage, err := common.GetBodyStorage(c)
 	if err != nil {
 		return
 	}
 	var body map[string]any
 	if err := common.DecodeJson(storage, &body); err != nil {
+		storage.Close()
 		return
 	}
 	pad := strings.Repeat("\u200b", n)
@@ -537,10 +592,8 @@ func pcPerturbPrefixForStickyPool(c *gin.Context, n int) {
 	}
 	if b, err := json.Marshal(body); err == nil {
 		if newStorage, err := common.CreateBodyStorage(b); err == nil {
-			old := storage
 			c.Set(common.KeyBodyStorage, newStorage)
 			c.Request.Body = io.NopCloser(newStorage)
-			_ = old
 			storage.Close()
 		}
 	}
@@ -658,7 +711,14 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 	}
 	// 不要使用context获取渠道信息，异步处理时可能会出现渠道信息不一致的情况
 	// do not use context to get channel info, there may be inconsistent channel info when processing asynchronously
-	if service.ShouldDisableChannel(err) && channelError.AutoBan {
+	// 池子「无可用账号」各形态（404 分组无账号 / 403 全部账号耗尽 / 500 等）描述
+	// 的是上游池子的账号分钟级浮动，不是本渠道凭证失效，绝不能触发渠道自动禁用：
+	// 403/500 形态会命中状态码自动禁用规则（404 不在表里），整渠道被拉黑后模型
+	// 全部不可用、直到手动测试或刷新才恢复——正是「会话突然终止、面板点一次
+	// 立即刷新就好」的根因。交给池子熔断器（2 分钟自动半开）处理即可
+	if pcIsPoolModelAbsent(err) || pcIsPoolExhausted(err) {
+		// skip auto-disable — pool-side state, not channel credential health
+	} else if service.ShouldDisableChannel(err) && channelError.AutoBan {
 		gopool.Go(func() {
 			service.DisableChannel(channelError, err.ErrorWithStatusCode())
 		})

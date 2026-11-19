@@ -5812,8 +5812,8 @@ func pcApplyAutoRule(manual bool, onTest func(done, total int)) (int, int, []str
 						dropped++
 						continue
 					}
-					if pcTestRateLimited(res) {
-						kept = append(kept, r) // 限流≠死：本轮突发所致，保留待下轮实测
+					if pcTestRateLimited(res) || pcTestPoolNoAccount(res) {
+						kept = append(kept, r) // 限流/池子无账号≠死：瞬时状态，保留待下轮实测
 						continue
 					}
 					dropped++                // 实测不可调：不进列表
@@ -6188,12 +6188,16 @@ func pcRunRefresh(force bool, sel []string) {
 				rep.progress("实测报价", done, total)
 			})
 			dead := map[string]bool{}
-			tested, infra, rl := 0, 0, 0
+			tested, infra, rl, pool := 0, 0, 0, 0
 			for _, c := range cands {
 				res := results[c.key()]
 				tested++
 				if pcTestRateLimited(res) {
 					rl++ // 限流=不定：不判死（否则自家突发会造成假阴性）
+					continue
+				}
+				if pcTestPoolNoAccount(res) {
+					pool++ // 池子无账号=不定：分钟级自愈，不判死（否则 fable/opus 随窗口反复被摘）
 					continue
 				}
 				// no_key 是「无法判断」而非基础设施失败，不进熔断分子
@@ -6205,13 +6209,13 @@ func pcRunRefresh(force bool, sel []string) {
 				}
 			}
 			// 限流/网络故障占比过高 = 结果不可信（我们自己太快或本地断网），熔断不标记
-			fuseOn := tested >= 5 && (infra+rl)*4 >= tested
+			fuseOn := tested >= 5 && (infra+rl+pool)*4 >= tested
 			if fuseOn {
 				dead = map[string]bool{}
 			}
 			rep.info([]string{
 				fmt.Sprintf("免费档候选: %d · 已测: %d", len(cands), tested),
-				fmt.Sprintf("判死: %d · 限流跳过: %d · 基础设施失败: %d", len(dead), rl, infra),
+				fmt.Sprintf("判死: %d · 限流跳过: %d · 池子无账号跳过: %d · 基础设施失败: %d", len(dead), rl, pool, infra),
 				"熔断: " + map[bool]string{true: "触发（失败占比过高，本轮不标记）", false: "未触发"}[fuseOn],
 			})
 			pcMu.Lock()
