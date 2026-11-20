@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -584,6 +585,20 @@ func pcPerturbPrefixForStickyPool(c *gin.Context, info *relaycommon.RelayInfo, n
 				msg.Content = append(ct, dto.MediaContent{Type: dto.ContentTypeText, Text: tail + head})
 			case nil:
 				msg.Content = tail
+			}
+		}
+	case *dto.OpenAIResponsesRequest:
+		// /v1/responses：ZCode 对池子模型的主流量（实测 token harness-auto 全走此
+		// 路径，request_path=/v1/responses）。Instructions 是 RawMessage（JSON）——
+		// 字符串形态就地追加；缺失/为 null 时置为扰动串本身；数组形态不常见，
+		// 追加进末尾一个字符串元素无从安放时保持原样（此时仍有下游分支兜底）
+		switch ins := string(req.Instructions); {
+		case ins == "" || ins == "null":
+			req.Instructions = json.RawMessage(strconv.Quote(tail + head))
+		default:
+			var s string
+			if json.Unmarshal(req.Instructions, &s) == nil {
+				req.Instructions, _ = json.Marshal(head + s + tail)
 			}
 		}
 	default:

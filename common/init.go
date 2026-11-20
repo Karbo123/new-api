@@ -192,7 +192,11 @@ func positiveUserSessionEnv(name string, fallback int) int {
 }
 
 func initConstantEnv() {
-	constant.StreamingTimeout = GetEnvOrDefault("STREAMING_TIMEOUT", 300)
+	// 默认 120s：上游池子劣质账号会让流「收 2 个事件后彻底静默」，300s 死寂
+	// 期间客户端一直干等（实测单次吊 395s）才拿到终止去重连。健康的大提示流
+	// 首字节实测最长 ~95s（ticker 收到数据即复位），120s 静默阈值留足余量；
+	// 需要更长静默容忍时用 STREAMING_TIMEOUT 环境变量覆盖
+	constant.StreamingTimeout = GetEnvOrDefault("STREAMING_TIMEOUT", 120)
 	constant.DifyDebug = GetEnvOrDefaultBool("DIFY_DEBUG", true)
 	constant.MaxFileDownloadMB = GetEnvOrDefault("MAX_FILE_DOWNLOAD_MB", 64)
 	constant.StreamScannerMaxBufferMB = GetEnvOrDefault("STREAM_SCANNER_MAX_BUFFER_MB", 128)
