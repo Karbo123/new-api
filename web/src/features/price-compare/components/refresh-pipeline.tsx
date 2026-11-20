@@ -351,7 +351,12 @@ export function RefreshPipelineCard({
   return (
     <div
       className={cn(
-        'bg-muted/50 text-muted-foreground rounded-md p-3 text-xs',
+        // min-w-0 + overflow-hidden：作为弹窗 grid 轨道的子项，杀掉 automatic
+        // minimum（grid/flex 子项仅在 overflow:visible 时才有内容最小宽度）。
+        // 否则阶段 current 的整行 nowrap 文本会把 grid 轨道固有宽度顶到内容宽，
+        // 整卡按内容宽排版、整体溢出 576px 弹窗（刷新刚开始时必现，随后
+        // current 变短又自愈——瞬态 bug）
+        'min-w-0 overflow-hidden bg-muted/50 text-muted-foreground rounded-md p-3 text-xs',
         className
       )}
     >
