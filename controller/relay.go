@@ -538,11 +538,16 @@ func pcIsPoolModelAbsent(err *types.NewAPIError) bool {
 		strings.Contains(msg, "not supported by any configured account")
 }
 
-// pcPerturbPrefixForStickyPool 池子 404 重试时的前缀扰动：往 system/instructions
-// 尾部追加 n 个零宽字符（U+200B）。上游 cursor 池按上下文前缀做缓存亲和把同
-// 会话绑定到特定账号，账号耗尽时同前缀请求永远 404——零宽字符改变内容指纹
-// 强制上游重新调度账号，且不改变语义（模型输出不受影响）、尾部错位不破坏已有
-// 缓存前缀。n≥2 时头部也加（任何只取短前缀的指纹算法都会命中变化）。
+// pcPerturbPrefixForStickyPool 池子 404 重试时的亲和扰动：往 system/instructions
+// 头部（位置 0）前置 n 个零宽字符（U+200B）。上游 cursor 池按上下文前缀做缓存
+// 亲和把同会话绑定到特定账号，账号耗尽时同前缀请求永远 404。
+// 位置 0 前置在所有可行的亲和方案下都有效：
+//   全量内容哈希——任何变更都改哈希；
+//   固定窗口前缀哈希——位置 0 必在一切窗口内（尾部追加对 20 万 token 对话
+//   可能落在窗口外，2026-11-21 用户指出后废弃）；
+//   最长公共前缀路由——首 token 不同，匹配长度归零，强制重新绑。
+// 语义不变（零宽字符模型输出无感）。位置 0 变更会打断 token 级缓存前缀，但
+// 触发时绑死账号已死——重试无论落到哪个账号都没有本会话缓存，无额外损失。
 // 关键：必须改解析后的请求结构体——relay 各 Helper 用 info.Request 结构体组装
 // 上游请求（ClaudeHelper 首行 DeepCopy(info.Request)，从不重读原始 body），
 // 只改 body storage 上游根本收不到扰动，等于白扰
@@ -550,55 +555,44 @@ func pcPerturbPrefixForStickyPool(c *gin.Context, info *relaycommon.RelayInfo, n
 	if info == nil || info.Request == nil || n <= 0 {
 		return
 	}
-	tail := strings.Repeat("\u200b", n)
-	head := ""
-	if n >= 2 {
-		head = strings.Repeat("\u200b", n-1)
-	}
+	pad := strings.Repeat("\u200b", n)
 	switch req := info.Request.(type) {
 	case *dto.ClaudeRequest:
 		// Claude /v1/messages：ZCode 对 claude 系模型的主流量
 		switch sys := req.System.(type) {
 		case string:
-			req.System = head + sys + tail
+			req.System = pad + sys
 		case []dto.ClaudeMediaMessage:
 			block := dto.ClaudeMediaMessage{Type: dto.ContentTypeText}
-			block.SetText(tail)
-			sys = append(sys, block)
-			if head != "" {
-				headBlock := dto.ClaudeMediaMessage{Type: dto.ContentTypeText}
-				headBlock.SetText(head)
-				sys = append([]dto.ClaudeMediaMessage{headBlock}, sys...)
-			}
-			req.System = sys
+			block.SetText(pad)
+			req.System = append([]dto.ClaudeMediaMessage{block}, sys...)
 		case nil:
-			req.System = tail
+			req.System = pad
 		}
 	case *dto.GeneralOpenAIRequest:
-		// chat completions：追加到首条消息内容（通常为 system）
+		// chat completions：前置到首条消息内容开头（通常为 system）
 		if len(req.Messages) > 0 {
 			msg := &req.Messages[0]
 			switch ct := msg.Content.(type) {
 			case string:
-				msg.Content = head + ct + tail
+				msg.Content = pad + ct
 			case []dto.MediaContent:
-				msg.Content = append(ct, dto.MediaContent{Type: dto.ContentTypeText, Text: tail + head})
+				msg.Content = append([]dto.MediaContent{{Type: dto.ContentTypeText, Text: pad}}, ct...)
 			case nil:
-				msg.Content = tail
+				msg.Content = pad
 			}
 		}
 	case *dto.OpenAIResponsesRequest:
 		// /v1/responses：ZCode 对池子模型的主流量（实测 token harness-auto 全走此
 		// 路径，request_path=/v1/responses）。Instructions 是 RawMessage（JSON）——
-		// 字符串形态就地追加；缺失/为 null 时置为扰动串本身；数组形态不常见，
-		// 追加进末尾一个字符串元素无从安放时保持原样（此时仍有下游分支兜底）
+		// 字符串形态就地前置；缺失/为 null 时置为扰动串本身
 		switch ins := string(req.Instructions); {
 		case ins == "" || ins == "null":
-			req.Instructions = json.RawMessage(strconv.Quote(tail + head))
+			req.Instructions = json.RawMessage(strconv.Quote(pad))
 		default:
 			var s string
 			if json.Unmarshal(req.Instructions, &s) == nil {
-				req.Instructions, _ = json.Marshal(head + s + tail)
+				req.Instructions, _ = json.Marshal(pad + s)
 			}
 		}
 	default:
@@ -621,7 +615,7 @@ func pcPerturbRawBodyInstructions(c *gin.Context, n int) {
 	}
 	pad := strings.Repeat("\u200b", n)
 	if instr, ok := body["instructions"].(string); ok {
-		body["instructions"] = instr + pad
+		body["instructions"] = pad + instr
 	} else {
 		body["instructions"] = pad
 	}
