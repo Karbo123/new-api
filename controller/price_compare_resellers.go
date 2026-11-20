@@ -15,11 +15,13 @@ package controller
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -161,34 +163,177 @@ func pcFetchApiklModels(force bool) {
 	})
 }
 
-func pcFetchApiklModelsImpl() ([]pcResellerModel, error) {
-	// 180s：model-plaza 是 300KB+ 大载荷，经 Cloudflare 大陆链路实测需 75s+，
-	// 30s 超时导致每次重拉失败、行情长期滞留旧缓存（2026-11-20 实测连续数日
-	// reseller[2] context deadline exceeded）
-	body, err := pcHttpGet(pcApiklURL, 180*time.Second, nil)
+// pcApiklPlazaResp model-plaza 分组定价载荷（机器生成，字段序稳定——截断容错
+// 解析依赖此稳定性）
+type pcApiklPlazaResp struct {
+	Data struct {
+		Groups []pcApiklPlazaGroup `json:"groups"`
+	} `json:"data"`
+}
+
+// pcHttpGetTolerant 同 pcHttpGet，但超时/中断时返回已接收的部分载荷（供截断
+// 容错解析——CF 大陆链路实测 300KB+ 载荷可能 180s 都传不完）
+func pcHttpGetTolerant(url string, timeout time.Duration) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	var resp struct {
-		Data struct {
-			Groups []struct {
-				Name   string  `json:"name"`
-				Rate   float64 `json:"rate_multiplier"`
-				Models []struct {
-					Name    string `json:"name"`
-					Pricing struct {
-						BillingMode    string   `json:"billing_mode"`
-						InputPrice     *float64 `json:"input_price"`
-						OutputPrice    *float64 `json:"output_price"`
-						CacheReadPrice *float64 `json:"cache_read_price"`
-						CacheWrite     *float64 `json:"cache_write_price"`
-					} `json:"pricing"`
-				} `json:"models"`
-			} `json:"groups"`
-		} `json:"data"`
+	req.Header.Set("User-Agent", pcUA)
+	resp, err := pcHTTPClient.Do(req)
+	if err != nil {
+		return "", err
 	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("http %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	// err 非 nil（超时中断）时 body 是已接收的部分——由调用方容错解析
+	return string(body), err
+}
+
+// pcApiklPlazaGroup / pcApiklPlazaModel model-plaza 分组定价（截断容错解析输出）
+type pcApiklPlazaGroup struct {
+	Name   string              `json:"name"`
+	Rate   float64             `json:"rate_multiplier"`
+	Models []pcApiklPlazaModel `json:"models"`
+}
+
+type pcApiklPlazaModel struct {
+	Name    string              `json:"name"`
+	Pricing pcApiklPlazaPricing `json:"pricing"`
+}
+
+type pcApiklPlazaPricing struct {
+	BillingMode    string   `json:"billing_mode"`
+	InputPrice     *float64 `json:"input_price"`
+	OutputPrice    *float64 `json:"output_price"`
+	CacheReadPrice *float64 `json:"cache_read_price"`
+	CacheWrite     *float64 `json:"cache_write_price"`
+}
+
+// pcParseApiklPlazaPartial 截断容错解析：分组/模型/定价字段序机器生成且稳定，
+// 正则抽取已到达的部分；模型归属其位置前最近的分组头。完整载荷走上方正规
+// json.Unmarshal，此处仅兜底。rate≤0 的组头也计入边界（防止其后模型错误归属
+// 前一组），行构建时再按 rate≤0 跳过
+func pcParseApiklPlazaPartial(body string) (resp pcApiklPlazaResp) {
+	reRate := regexp.MustCompile(`"rate_multiplier":([0-9.]+)`)
+	reName := regexp.MustCompile(`"name":"([^"]+)"`)
+	reModel := regexp.MustCompile(`"name":"([^"]+)","platform":"[^"]*","pricing":\{"billing_mode":"([a-z_]+)"`)
+	type head struct {
+		pos  int
+		name string
+		rate float64
+	}
+	var heads []head
+	for _, loc := range reRate.FindAllStringSubmatchIndex(body, -1) {
+		rate, err := strconv.ParseFloat(body[loc[2]:loc[3]], 64)
+		if err != nil {
+			continue
+		}
+		nm := reName.FindAllStringSubmatch(body[:loc[0]], -1)
+		if len(nm) == 0 {
+			continue
+		}
+		heads = append(heads, head{loc[0], nm[len(nm)-1][1], rate})
+	}
+	if len(heads) == 0 {
+		return
+	}
+	// 每模型归属其位置前最近的分组头；组按出现顺序落位。
+	// 字段级提取：模型对象里 intervals 可能含嵌套对象，「首个 }」切片法不可靠，
+	// 改为在模型起点后的有界窗口（700 字符）内按字段名抽取四个价格
+	var outs []pcApiklPlazaGroup
+	reNumIn := regexp.MustCompile(`"input_price":([0-9.eE+-]+|null)`)
+	reNumOut := regexp.MustCompile(`"output_price":([0-9.eE+-]+|null)`)
+	reNumRead := regexp.MustCompile(`"cache_read_price":([0-9.eE+-]+|null)`)
+	reNumWrite := regexp.MustCompile(`"cache_write_price":([0-9.eE+-]+|null)`)
+	fnum := func(seg string, re *regexp.Regexp) *float64 {
+		mm := re.FindStringSubmatch(seg)
+		if mm == nil || mm[1] == "null" {
+			return nil
+		}
+		v, err := strconv.ParseFloat(mm[1], 64)
+		if err != nil {
+			return nil
+		}
+		return &v
+	}
+	modelMatches := reModel.FindAllStringSubmatchIndex(body, -1)
+	for _, m := range modelMatches {
+		gi := -1
+		for i, h := range heads {
+			if h.pos < m[0] {
+				gi = i
+			} else {
+				break
+			}
+		}
+		if gi < 0 {
+			continue
+		}
+		winEnd := m[0] + 700
+		if winEnd > len(body) {
+			winEnd = len(body)
+		}
+		seg := body[m[0]:winEnd]
+		if reNumIn.FindStringSubmatch(seg) == nil {
+			continue
+		}
+		pricing := pcApiklPlazaPricing{
+			BillingMode:    body[m[4]:m[5]],
+			InputPrice:     fnum(seg, reNumIn),
+			OutputPrice:    fnum(seg, reNumOut),
+			CacheReadPrice: fnum(seg, reNumRead),
+			CacheWrite:     fnum(seg, reNumWrite),
+		}
+		for len(outs) <= gi {
+			h := heads[len(outs)]
+			outs = append(outs, pcApiklPlazaGroup{Name: h.name, Rate: h.rate})
+		}
+		outs[gi].Models = append(outs[gi].Models, pcApiklPlazaModel{
+			Name:    body[m[2]:m[3]],
+			Pricing: pricing,
+		})
+	}
+	for _, og := range outs {
+		g := pcApiklPlazaGroup{Name: og.Name, Rate: og.Rate, Models: og.Models}
+		resp.Data.Groups = append(resp.Data.Groups, g)
+	}
+	return
+}
+
+
+func pcFetchApiklModelsImpl() ([]pcResellerModel, error) {
+	// 180s×2 + 截断容错：model-plaza 是 300KB+ 大载荷，经 CF 大陆链路实测
+	// 75s~180s+ 且随机中断，30s 超时曾导致行情滞留错价缓存数日
+	// （2026-11-21 连续 reseller[2] context deadline exceeded）。中断时保留
+	// 已接收部分——分组/模型/定价字段序机器生成且稳定，截断体可正则抽取
+	//（claude 系靠前，通常完整可用）
+	var body string
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			time.Sleep(3 * time.Second)
+		}
+		b, err := pcHttpGetTolerant(pcApiklURL, 180*time.Second)
+		if len(b) > len(body) {
+			body = b // 保留数据最多的那一轮
+		}
+		if err == nil {
+			lastErr = nil
+			break
+		}
+		lastErr = err
+	}
+	if body == "" {
+		return nil, lastErr
+	}
+	var resp pcApiklPlazaResp
 	if err := json.Unmarshal([]byte(body), &resp); err != nil {
-		return nil, err
+		resp = pcParseApiklPlazaPartial(body)
 	}
 	// 官方原价表：站点分组定价即官方 per-token 价（组无关，仅组倍率不同），
 	// 用于 × 保险箱各 key 的实际结算倍率；全组最低一份作为探测缺失时的兜底
@@ -202,26 +347,27 @@ func pcFetchApiklModelsImpl() ([]pcResellerModel, error) {
 			if m.Pricing.BillingMode != "token" || m.Pricing.InputPrice == nil {
 				continue // 生图按张计价等不进 token 比价
 			}
-		if _, ok := official[m.Name]; !ok {
-			official[m.Name] = pcResellerModel{
-				// 站点模型广场以美元标价（$/1M token，见 Claude-Max 组页面），
-				// 币种必须标 USD 让统一行情按汇率折算 ¥ 实际价——此前硬标 CNY
-				// 少乘汇率，显示价直接缩水 6.7 倍
-				Channel: "apikl", Name: m.Name, Currency: "USD",
-				In:    *m.Pricing.InputPrice * 1e6,
-				Out:   f64v(m.Pricing.OutputPrice) * 1e6,
-				Read:  f64v(m.Pricing.CacheReadPrice) * 1e6,
-				Write: f64v(m.Pricing.CacheWrite) * 1e6,
+			if _, ok := official[m.Name]; !ok {
+				official[m.Name] = pcResellerModel{
+					// 站点以「美元额度」计价，但充值汇率是 1 RMB = 1 站点 USD
+					// （用户 2026-11-20 实充确认），所以站点标价数值上就等于 ¥ 实付：
+					// $4/M 组内价 ×0.8 结算倍率 = $3.2/M 实付 = ¥3.2/M。标 CNY 使
+					// 统一行情不做美元汇率折算（按 6.69 折会虚增 6.7 倍）
+					Channel: "apikl", Name: m.Name, Currency: "CNY",
+					In:    *m.Pricing.InputPrice * 1e6,
+					Out:   f64v(m.Pricing.OutputPrice) * 1e6,
+					Read:  f64v(m.Pricing.CacheReadPrice) * 1e6,
+					Write: f64v(m.Pricing.CacheWrite) * 1e6,
+				}
 			}
-		}
-		row := pcResellerModel{
-			Channel: "apikl", Name: m.Name, Currency: "USD",
-			In:    *m.Pricing.InputPrice * 1e6 * g.Rate,
-			Out:   f64v(m.Pricing.OutputPrice) * 1e6 * g.Rate,
-			Read:  f64v(m.Pricing.CacheReadPrice) * 1e6 * g.Rate,
-			Write: f64v(m.Pricing.CacheWrite) * 1e6 * g.Rate,
-			Note:  "组 " + g.Name, GroupRate: g.Rate,
-		}
+			row := pcResellerModel{
+				Channel: "apikl", Name: m.Name, Currency: "CNY",
+				In:    *m.Pricing.InputPrice * 1e6 * g.Rate,
+				Out:   f64v(m.Pricing.OutputPrice) * 1e6 * g.Rate,
+				Read:  f64v(m.Pricing.CacheReadPrice) * 1e6 * g.Rate,
+				Write: f64v(m.Pricing.CacheWrite) * 1e6 * g.Rate,
+				Note:  "组 " + g.Name, GroupRate: g.Rate,
+			}
 			if prev, ok := fallback[m.Name]; !ok || row.In < prev.In {
 				cp := row
 				fallback[m.Name] = &cp
