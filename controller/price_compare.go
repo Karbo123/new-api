@@ -5867,6 +5867,7 @@ func pcApplyAutoRule(manual bool, onTest func(done, total int)) (int, int, []str
 	if err := pcSavePriority(cfg); err != nil {
 		return 0, 0, missing, 0, 0, nil, dropped
 	}
+	pcInvalidateAliasFold() // 优先级列表变了：/v1/models 的别名折叠表随之失效
 	// 列表已落盘，供应商顺序随之刷新（必须放在落盘后：内部会重新读列表）
 	pcAttachProviderOrder(rows)
 	// 同步到 new-api 渠道：pcSyncChannelKeys 内部重新读列表（此时已是刚落盘的
@@ -6437,6 +6438,7 @@ func PostPriceComparePriority(c *gin.Context) {
 		c.JSON(200, gin.H{"success": false, "message": err.Error()})
 		return
 	}
+	pcInvalidateAliasFold() // 优先级列表变了：/v1/models 的别名折叠表随之失效
 	// 手工调整立即生效：重建供应商顺序（provider.order）与比价路由表
 	if rows, _ := pcGetUnified(false); len(rows) > 0 {
 		pcAttachProviderOrder(rows)

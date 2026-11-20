@@ -266,6 +266,15 @@ func ListModels(c *gin.Context, modelType int) {
 	if len(ownerGroups) > 0 {
 		ownerByModel = getPreferredModelOwners(userModelNames, ownerGroups)
 	}
+	// 比价管理渠道会为同一模型登记多个名字（OR 点号规范名 + 各上游连字符原生名，
+	// 靠 model_mapping 翻译回上游）。别名是跨渠道 fallback 的地基（ability 按请求名
+	// 精确匹配），但对客户端展示是噪音——Claude Code desktop / ZCode 拉 /v1/models
+	// 会看到同一模型的多张脸（如 claude-fable-5.2 与 claude-fable-5-2）。这里按
+	// 优先级列表折叠：每个别名组只保留规范名一个出口。只是展示层过滤，路由能力
+	// （渠道 models / abilities / model_mapping）完全不动
+	if fold := pcModelAliasFoldCached(); len(fold) > 0 {
+		userModelNames = pcFoldModelNames(userModelNames, fold)
+	}
 	userOpenAiModels := make([]dto.OpenAIModels, 0, len(userModelNames))
 	for _, modelName := range userModelNames {
 		userOpenAiModels = append(userOpenAiModels, buildOpenAIModel(modelName, ownerByModel))
