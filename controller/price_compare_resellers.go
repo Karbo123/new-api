@@ -162,7 +162,10 @@ func pcFetchApiklModels(force bool) {
 }
 
 func pcFetchApiklModelsImpl() ([]pcResellerModel, error) {
-	body, err := pcHttpGet(pcApiklURL, 30*time.Second, nil)
+	// 180s：model-plaza 是 300KB+ 大载荷，经 Cloudflare 大陆链路实测需 75s+，
+	// 30s 超时导致每次重拉失败、行情长期滞留旧缓存（2026-11-20 实测连续数日
+	// reseller[2] context deadline exceeded）
+	body, err := pcHttpGet(pcApiklURL, 180*time.Second, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -199,23 +202,26 @@ func pcFetchApiklModelsImpl() ([]pcResellerModel, error) {
 			if m.Pricing.BillingMode != "token" || m.Pricing.InputPrice == nil {
 				continue // 生图按张计价等不进 token 比价
 			}
-			if _, ok := official[m.Name]; !ok {
-				official[m.Name] = pcResellerModel{
-					Channel: "apikl", Name: m.Name, Currency: "CNY",
-					In:    *m.Pricing.InputPrice * 1e6,
-					Out:   f64v(m.Pricing.OutputPrice) * 1e6,
-					Read:  f64v(m.Pricing.CacheReadPrice) * 1e6,
-					Write: f64v(m.Pricing.CacheWrite) * 1e6,
-				}
+		if _, ok := official[m.Name]; !ok {
+			official[m.Name] = pcResellerModel{
+				// 站点模型广场以美元标价（$/1M token，见 Claude-Max 组页面），
+				// 币种必须标 USD 让统一行情按汇率折算 ¥ 实际价——此前硬标 CNY
+				// 少乘汇率，显示价直接缩水 6.7 倍
+				Channel: "apikl", Name: m.Name, Currency: "USD",
+				In:    *m.Pricing.InputPrice * 1e6,
+				Out:   f64v(m.Pricing.OutputPrice) * 1e6,
+				Read:  f64v(m.Pricing.CacheReadPrice) * 1e6,
+				Write: f64v(m.Pricing.CacheWrite) * 1e6,
 			}
-			row := pcResellerModel{
-				Channel: "apikl", Name: m.Name, Currency: "CNY",
-				In:    *m.Pricing.InputPrice * 1e6 * g.Rate,
-				Out:   f64v(m.Pricing.OutputPrice) * 1e6 * g.Rate,
-				Read:  f64v(m.Pricing.CacheReadPrice) * 1e6 * g.Rate,
-				Write: f64v(m.Pricing.CacheWrite) * 1e6 * g.Rate,
-				Note:  "组 " + g.Name, GroupRate: g.Rate,
-			}
+		}
+		row := pcResellerModel{
+			Channel: "apikl", Name: m.Name, Currency: "USD",
+			In:    *m.Pricing.InputPrice * 1e6 * g.Rate,
+			Out:   f64v(m.Pricing.OutputPrice) * 1e6 * g.Rate,
+			Read:  f64v(m.Pricing.CacheReadPrice) * 1e6 * g.Rate,
+			Write: f64v(m.Pricing.CacheWrite) * 1e6 * g.Rate,
+			Note:  "组 " + g.Name, GroupRate: g.Rate,
+		}
 			if prev, ok := fallback[m.Name]; !ok || row.In < prev.In {
 				cp := row
 				fallback[m.Name] = &cp

@@ -107,8 +107,23 @@ func pcProbeTarget(kind string) (string, map[string]string) {
 
 // pcSub2apiKeyRate sub2api 系（apikl/ikun）逐 key 实际结算倍率：GET /v1/sub2api/billing
 // 免费（key 鉴权），effective_rate_multiplier 是真实计费口径——站点模型广场的挂牌
-// 分组倍率可能与实际结算不一致（ikun CC 组挂牌 ×0.35 实结 ×0.45，用户后台对账发现）
+// 分组倍率可能与实际结算不一致（ikun CC 组挂牌 ×0.35 实结 ×0.45，用户后台对账发现）。
+// 两次尝试：CF 大陆链路对该端点实测约半数概率超时，读失败返回 0 会让行情整组
+// 回退到「全组最低价」错价兜底（2026-11-20 apikl 全模型按 Krio 组 0.06 倍率
+// 标价、比真实价低 13 倍的事故）
 func pcSub2apiKeyRate(base, key string) float64 {
+	for attempt := 0; attempt < 2; attempt++ {
+		if attempt > 0 {
+			time.Sleep(2 * time.Second)
+		}
+		if r := pcSub2apiKeyRateOnce(base, key); r > 0 {
+			return r
+		}
+	}
+	return 0
+}
+
+func pcSub2apiKeyRateOnce(base, key string) float64 {
 	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(base, "/")+"/v1/sub2api/billing", nil)
 	if err != nil {
 		return 0
@@ -238,7 +253,29 @@ func pcRefreshAccessCache() {
 	}
 	wg.Wait()
 
+	// 稳态合并：本轮 billing 倍率读失败（rate=0）但上一轮读成功的 key，沿用旧倍率。
+	// 结算倍率端点经 CF 大陆链路约半数概率超时——整表覆盖会让行情在「真价」与
+	// 「Krio 组错价兜底」之间随网络运气来回翻转（2026-11-20 事故根因）
 	pcAccessMu.Lock()
+	if prev := pcAccessCache.data; prev != nil {
+		for kind, res := range out {
+			old, ok := prev[kind]
+			if !ok {
+				continue
+			}
+			oldByKey := map[string]float64{}
+			for _, k := range old.Keys {
+				oldByKey[k.Key] = k.Rate
+			}
+			for i := range res.Keys {
+				if res.Keys[i].Rate <= 0 {
+					if oldRate := oldByKey[res.Keys[i].Key]; oldRate > 0 {
+						res.Keys[i].Rate = oldRate
+					}
+				}
+			}
+		}
+	}
 	pcAccessCache.at = time.Now()
 	pcAccessCache.data = out
 	pcAccessCache.keys = probed
