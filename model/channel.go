@@ -793,6 +793,56 @@ func hasEnabledMultiKey(keys []string, statusList map[int]int) bool {
 	return false
 }
 
+// MultiKeyDisableKeepingSentinel 与 UpdateChannelStatus 同语义，但专供「欠费自动
+// 停用」路径：若禁用该 key 后将无任何可用 key，则跳过本次禁用（保留哨兵）并返回
+// false。判断与写入都在 channelStatusLock/pollingLock 内完成——调用方在锁外自行
+// 统计会因两个并发 402 各自读到「还有另一把可用」而双禁（2026-11-21 OpenCode
+// 实测：两并发请求各禁一把 → 渠道 "All keys are disabled" 拉黑 → argon 全面
+// 不可用且永不恢复，面板闪电测试却仍绿）。
+//
+// 保底口径：真欠费时哨兵请求也会失败，跨渠道 fallback 兜底；池子/余额恢复后该
+// key 能被试探成功并自动转回启用（auto-recover），不会死锁。
+func MultiKeyDisableKeepingSentinel(channelId int, usingKey string, reason string) bool {
+	if common.MemoryCacheEnabled {
+		channelStatusLock.Lock()
+		defer channelStatusLock.Unlock()
+	}
+	pollingLock := GetChannelPollingLock(channelId)
+	pollingLock.Lock()
+	defer pollingLock.Unlock()
+
+	ch, err := GetChannelById(channelId, false)
+	if err != nil || ch == nil || !ch.ChannelInfo.IsMultiKey {
+		return false
+	}
+	keys := ch.GetKeys()
+	usingIdx := -1
+	for i, k := range keys {
+		if strings.TrimSpace(k) == usingKey {
+			usingIdx = i
+			break
+		}
+	}
+	if usingIdx < 0 {
+		return false
+	}
+	// 锁内重新统计：除本次目标外还有几把可用
+	enabledLeft := 0
+	for i := range keys {
+		if i == usingIdx {
+			continue
+		}
+		if st, ok := ch.ChannelInfo.MultiKeyStatusList[i]; !ok || st == common.ChannelStatusEnabled {
+			enabledLeft++
+		}
+	}
+	if enabledLeft == 0 {
+		common.SysLog(fmt.Sprintf("multi-key auto-disable skipped: channel #%d keeps last enabled key as sentinel (upstream pool may recover)", channelId))
+		return false
+	}
+	return UpdateChannelStatus(channelId, usingKey, common.ChannelStatusManuallyDisabled, reason)
+}
+
 func UpdateChannelStatus(channelId int, usingKey string, status int, reason string) bool {
 	if common.MemoryCacheEnabled {
 		channelStatusLock.Lock()

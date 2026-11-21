@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"crypto/sha256"
 	"encoding/json"
 
 	"github.com/QuantumNous/new-api/common"
@@ -265,6 +266,10 @@ func Relay(c *gin.Context, relayFormat types.RelayFormat) {
 
 		if newAPIError == nil {
 			relayInfo.LastError = nil
+			// 成功：该 key 的瞬时欠费计数清零（避免历史抖动累计误伤）
+			if usedKey := common.GetContextKeyString(c, constant.ContextKeyChannelKey); usedKey != "" {
+				pcResetInsufficient(channel.Id, usedKey)
+			}
 			// 试探成功的欠费 key：清除自动停用标记（面板恢复「启用」，回到正常轮换）。
 			// 仅处理「仍在停用名单里且原因是欠费自动停用」的 key——手动停用的 key
 			// 不会被选中，这里天然不会误放行
@@ -511,6 +516,42 @@ func pcIsInsufficientBalance(err *types.NewAPIError) bool {
 		strings.Contains(msg, "欠费")
 }
 
+// ---- 欠费停用的瞬时 402 容错：连续 2 次才真正停用该 key ----
+// 订阅制渠道（OpenCode Go 等）的 402 实测是瞬时额度波动——同 key 数秒后即可
+// 成功（2026-11-21 14:42 判死两把 key，15:0x 直连同一把 key 已 200）。单次 402
+// 就停用过于激进：会让一次余额检查抖动演进成「渠道整条拉黑、模型全面不可用」。
+// 计数键 = 渠道ID + key 指纹；成功请求或换错误类型时清零。
+var pcInsufficientStreakMu sync.Mutex
+var pcInsufficientStreak = map[string]int{}
+
+const pcInsufficientThreshold = 2
+
+func pcInsufficientKeyID(channelID int, usingKey string) string {
+	return fmt.Sprintf("%d|%x", channelID, sha256.Sum256([]byte(usingKey)))
+}
+
+// pcShouldDisableOnInsufficient 累计该 key 的连续 402 次数；达到阈值返回 true
+// （调用方随后执行停用，并在停用成功/失败后由 pcResetInsufficient 清零）
+func pcShouldDisableOnInsufficient(channelID int, usingKey string) bool {
+	id := pcInsufficientKeyID(channelID, usingKey)
+	pcInsufficientStreakMu.Lock()
+	defer pcInsufficientStreakMu.Unlock()
+	pcInsufficientStreak[id]++
+	if pcInsufficientStreak[id] < pcInsufficientThreshold {
+		common.SysLog(fmt.Sprintf("insufficient-balance transient for channel #%d key %s… (streak=%d/%d, not disabling yet)",
+			channelID, common.LocalLogPreview(usingKey), pcInsufficientStreak[id], pcInsufficientThreshold))
+		return false
+	}
+	return true
+}
+
+func pcResetInsufficient(channelID int, usingKey string) {
+	id := pcInsufficientKeyID(channelID, usingKey)
+	pcInsufficientStreakMu.Lock()
+	delete(pcInsufficientStreak, id)
+	pcInsufficientStreakMu.Unlock()
+}
+
 // pcIsUpstreamPolicyReject 判定上游「内容策略」400 拦截（Anthropic AUP 分类器
 // 对 Claude Code 池子账号的拒绝文案）。该拦截是概率性误伤（同一请求换个账号/
 // 渠道常能通过），应触发跨渠道兜底而非按确定性客户端错误终止；真正违规的
@@ -712,42 +753,20 @@ func processChannelError(c *gin.Context, channelError types.ChannelError, err *t
 	// 缺失时会构造丢 ChannelInfo 的裸渠道对象（IsMultiKey 恒 false），必须现查库；
 	// 单 key 渠道不走此分支，仍由全局「自动禁用渠道」开关决定，行为不变
 	if channelError.UsingKey != "" && pcIsInsufficientBalance(err) {
-		gopool.Go(func() {
-			ch, e := model.GetChannelById(channelError.ChannelId, false)
-			if e != nil || ch == nil || !ch.ChannelInfo.IsMultiKey {
-				return
-			}
-			// 保底一把：本次拉黑后将无任何 enabled key（如上游池子额度耗尽连拒
-			// 全部 key）时跳过——保留一把哨兵 key 继续轮询，池子恢复后请求自动
-			// 痊愈；真欠费时哨兵也失败，但跨渠道 fallback 会兜底，且全禁死锁
-			// （无人可被试探、auto-recover 永不触发）不再发生
-			usingIdx := -1
-			keys := strings.Split(ch.Key, "\n")
-			for i, k := range keys {
-				if strings.TrimSpace(k) == channelError.UsingKey {
-					usingIdx = i
-					break
+		// 瞬时 402 容错：连续 2 次才真停用（订阅制渠道额度检查抖动实测常见）
+		if pcShouldDisableOnInsufficient(channelError.ChannelId, channelError.UsingKey) {
+			gopool.Go(func() {
+				// 哨兵判断与写入都在 model 层锁内完成：调用方在锁外统计「还有几把
+				// 可用」会被并发双 402 绕过——两个请求各读到「另一把还可用」，各禁
+				// 一把，渠道被整条拉黑（2026-11-21 OpenCode argon 事故）
+				if model.MultiKeyDisableKeepingSentinel(channelError.ChannelId, channelError.UsingKey,
+					model.MultiKeyAutoDisableReason) {
+					common.SysLog(fmt.Sprintf("multi-key auto-disable: channel #%d one key marked disabled (insufficient balance, no key value logged)",
+						channelError.ChannelId))
 				}
-			}
-			enabledLeft := 0
-			for i := range keys {
-				if i == usingIdx {
-					continue
-				}
-				if st, ok := ch.ChannelInfo.MultiKeyStatusList[i]; !ok || st == common.ChannelStatusEnabled {
-					enabledLeft++
-				}
-			}
-			if usingIdx >= 0 && enabledLeft == 0 {
-				common.SysLog(fmt.Sprintf("multi-key auto-disable skipped: channel #%d keeps last enabled key as sentinel (upstream pool may recover)", channelError.ChannelId))
-				return
-			}
-			if model.UpdateChannelStatus(channelError.ChannelId, channelError.UsingKey,
-				common.ChannelStatusManuallyDisabled, model.MultiKeyAutoDisableReason) {
-				common.SysLog(fmt.Sprintf("multi-key auto-disable: channel #%d one key marked disabled (insufficient balance, no key value logged)",
-					channelError.ChannelId))
-			}
-		})
+				pcResetInsufficient(channelError.ChannelId, channelError.UsingKey)
+			})
+		}
 	}
 	// 不要使用context获取渠道信息，异步处理时可能会出现渠道信息不一致的情况
 	// do not use context to get channel info, there may be inconsistent channel info when processing asynchronously

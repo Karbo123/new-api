@@ -62,6 +62,11 @@ func main() {
 		return
 	}
 
+	// 崩溃取证：stderr（Go 运行时 panic 栈的输出去处）落到日志目录。隐藏窗口
+	// 启动时 stderr 无处可去，进程静默退出后无法定位——2026-11-21 用
+	// gemini-4-argon 时闪退即因缺少这份证据而无法归因
+	common.InstallCrashForensics(*common.LogDir)
+
 	common.SysLog("New API " + common.Version + " started")
 	if os.Getenv("GIN_MODE") != "debug" {
 		gin.SetMode(gin.ReleaseMode)
@@ -187,7 +192,8 @@ func main() {
 		return
 	}
 	server.Use(gin.CustomRecovery(func(c *gin.Context, err any) {
-		common.SysLog(fmt.Sprintf("panic detected: %v", err))
+		// 落盘完整栈：panic 只记一行 %v 事后无从定位（2026-11-21 argon 闪退排查）
+		common.ReportPanic("http-handler", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": gin.H{
 				"message": fmt.Sprintf("Panic detected, error: %v. Please submit a issue here: https://github.com/Calcium-Ion/new-api", err),
